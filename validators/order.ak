@@ -92,7 +92,9 @@ validator order {
               ),
             }?,
             token_burned(self, policy, d.token)?,
-            (paid_to(self, d.buyer) + self.fee >= escrow)?,
+            // Full escrow back, fee on the canceller. Same reasoning as
+            // `settle`.
+            (paid_to(self, d.buyer) >= escrow)?,
           }
         }
 
@@ -281,11 +283,23 @@ fn continues(
   }
 }
 
-/// Final closing: token burned, supplier paid, remainder returned.
+/// Final closing: token burned, supplier paid, remainder returned in full.
 ///
-/// The `self.fee` allowance sits on the buyer's side because the buyer is the
-/// one who funded the escrow; on supplier-initiated paths it leaves the
-/// supplier at most the transaction fee.
+/// The escrow is accounted for exactly: the supplier receives what it is
+/// owed, the buyer receives the rest, and the transaction fee is paid by
+/// whoever submits, out of their own inputs.
+///
+/// An earlier version allowed `paid_to(buyer) + self.fee`, so the fee could be
+/// charged against the buyer's refund. Value conservation caps the supplier's
+/// net take at `owed_to_supplier` either way, so that allowance never let the
+/// supplier steal outright — but it did let the supplier inflate the fee at
+/// zero cost to itself and shrink the buyer's refund by exactly that amount,
+/// on every supplier-initiated path. Small per delivery, and levied on every
+/// delivery, against the party this product exists to protect.
+///
+/// Removing it also serves the adoption metric: each party must pay its own
+/// fees from its own wallet, and a fee drawn from the buyer's escrow is not
+/// that.
 fn settle(
   self: Transaction,
   d: Order,
@@ -296,7 +310,7 @@ fn settle(
   and {
     token_burned(self, policy, d.token)?,
     (paid_to(self, d.supplier) >= owed_to_supplier)?,
-    (paid_to(self, d.buyer) + self.fee >= escrow - owed_to_supplier)?,
+    (paid_to(self, d.buyer) >= escrow - owed_to_supplier)?,
   }
 }
 
@@ -740,6 +754,65 @@ test reception_window_runs_from_the_sealed_timestamp() fail {
       extra_signatories: [supplier],
     }
   order.spend(Some(dat(sealed)), ClaimSilence, ref, tx)
+}
+
+// ### Fee accounting (regression tests for the removed `self.fee` allowance)
+//
+// Every other test in this file runs on `placeholder`, where `fee` is zero,
+// so none of them exercise this. These set a real fee.
+
+/// ATTACK, now blocked: the supplier claims silence with a padded 3 ADA fee
+/// and hands the buyer only 17 ADA of the 20 it is owed. The 3 ADA came out
+/// of the buyer's refund; the supplier's own net take was unchanged, so it
+/// cost the supplier nothing to inflate.
+test supplier_cannot_charge_its_fee_to_the_buyer() fail {
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(100_000_000, shipped)],
+      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 17_000_000)],
+      mint: from_asset(policy, token, -1),
+      fee: 3_000_000,
+      validity_range: interval.between(10_600, 10_700),
+      extra_signatories: [supplier],
+    }
+  order.spend(Some(dat(shipped)), ClaimSilence, ref, tx)
+}
+
+/// The correct construction: the supplier brings its own 5 ADA input, pays
+/// the 3 ADA fee from it, and the buyer still receives the full 20 ADA.
+/// The supplier nets 77 ADA on an 80 ADA claim — it bore its own fee.
+test supplier_funds_its_own_fee_on_a_silence_claim() {
+  let funding =
+    Input { output_reference: ref_b, output: to_key(supplier, 5_000_000) }
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(100_000_000, shipped), funding],
+      outputs: [to_key(supplier, 82_000_000), to_key(buyer, 20_000_000)],
+      mint: from_asset(policy, token, -1),
+      fee: 3_000_000,
+      validity_range: interval.between(10_600, 10_700),
+      extra_signatories: [supplier],
+    }
+  order.spend(Some(dat(shipped)), ClaimSilence, ref, tx)
+}
+
+/// The same allowance existed on `Cancel`: a refund short by the fee amount
+/// is no longer a full refund.
+test cancellation_refund_is_not_reduced_by_the_fee() fail {
+  let created = Created { request: #"aa" }
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(100_000_000, created)],
+      outputs: [to_key(buyer, 97_000_000)],
+      mint: from_asset(policy, token, -1),
+      fee: 3_000_000,
+      validity_range: interval.between(100, 200),
+      extra_signatories: [buyer],
+    }
+  order.spend(Some(dat(created)), Cancel, ref, tx)
 }
 
 // ### Double satisfaction (regression tests for the one-order-per-tx rule)
