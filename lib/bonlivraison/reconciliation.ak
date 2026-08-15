@@ -94,26 +94,58 @@ test totally_missing_delivery_is_admissible() {
   admissible(80_000_000, 0)
 }
 
-/// Central property: whatever the admissible declaration, the supplier can
-/// never collect more than its own commitment.
-///
-/// KNOWN WEAKNESS: this property is close to vacuous. `accepted` is built by
-/// construction to satisfy `admissible`, and `immediately_due` is the
-/// identity, so the assertion reduces to a tautology about the modulo
-/// operator. Replacing `admissible` with `True` does not make it fail. It is
-/// kept here only to preserve the existing baseline; a real state-machine
-/// property test is tracked as follow-up work.
-test never_more_than_the_manifest(n via fuzz.both(fuzz.int(), fuzz.int())) {
-  let (manifest, raw) = n
-  let manifest_total = abs_int(manifest)
-  let accepted = abs_int(raw) % ( manifest_total + 1 )
-  admissible(manifest_total, accepted)? && immediately_due(accepted) <= manifest_total
+/// Severity ordering of the outcomes, from the supplier's point of view.
+fn severity(outcome: Outcome) -> Int {
+  when outcome is {
+    Exact -> 0
+    Tolerated -> 1
+    Contested -> 2
+  }
 }
 
-fn abs_int(x: Int) -> Int {
-  if x < 0 {
-    -x
-  } else {
-    x
-  }
+/// Central property: an admissible declaration never lets the supplier
+/// collect more than its own commitment.
+///
+/// Stated as an implication, with BOTH totals drawn freely. That is the whole
+/// point: the generator must not do the work the assertion is supposed to do.
+/// An earlier version derived `accepted` by modulo so that it satisfied
+/// `admissible` by construction, which made the assertion a tautology about
+/// the modulo operator — stubbing `admissible` to `True` left it passing.
+/// This version fails under that mutation.
+test admissible_declaration_never_exceeds_the_manifest(
+  n via fuzz.tuple(fuzz.int(), fuzz.int()),
+) {
+  let (manifest_total, accepted_total) = n
+  !admissible(manifest_total, accepted_total) || immediately_due(accepted_total) <= manifest_total
+}
+
+/// Declaring more received goods never moves the outcome further from Exact.
+///
+/// Monotonicity is what makes the rule safe to apply without comparing line
+/// items: a buyer cannot improve its position by understating, and cannot
+/// trip an arbitration by overstating within the manifest.
+test declaring_more_never_worsens_the_outcome(
+  n via fuzz.tuple4(
+    fuzz.int_between(0, 100_000_000),
+    fuzz.int_between(0, 10_000_000),
+    fuzz.int_between(0, 100_000_000),
+    fuzz.int_between(0, 100_000_000),
+  ),
+) {
+  let (manifest_total, tolerance, x, y) = n
+  let lower =
+    if x < y {
+      x
+    } else {
+      y
+    }
+  let higher =
+    if x < y {
+      y
+    } else {
+      x
+    }
+  severity(reconcile(manifest_total, higher, tolerance)) <= severity(
+    reconcile(manifest_total, lower, tolerance),
+  )
 }

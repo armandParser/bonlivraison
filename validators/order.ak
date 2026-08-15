@@ -6,7 +6,9 @@
 
 use aiken/collection/dict
 use aiken/collection/list
-use aiken/interval
+use aiken/crypto.{VerificationKeyHash}
+use aiken/fuzz
+use aiken/interval.{Interval}
 use bonlivraison/reconciliation.{Contested, admissible, reconcile}
 use bonlivraison/tx.{
   continuing_output, event_time, paid_to, script_input_count, signed_by,
@@ -874,4 +876,160 @@ test double_satisfaction_refused() fail {
       tx,
     ),
   }
+}
+
+// ### The security invariant, as a property
+//
+// The supplier can never collect more than the manifest it sealed itself,
+// whichever path the order takes out of escrow. Everything else in this
+// contract is machinery; this is the promise.
+
+/// Builds an order datum with a chosen tolerance, all else fixed.
+fn order_with_tolerance(tolerance: Int, state: State) -> Order {
+  Order {
+    token,
+    buyer,
+    supplier,
+    arbiter,
+    terms: Terms {
+      acceptance_deadline: 20_000,
+      reception_window: 500,
+      dispute_window: 1_000,
+      tolerance,
+    },
+    state,
+  }
+}
+
+/// A settling transaction: order in, token burned, supplier and buyer paid.
+fn settlement_tx(
+  d: Order,
+  escrow: Int,
+  payout: Int,
+  range: Interval<Int>,
+  signers: List<VerificationKeyHash>,
+) -> Transaction {
+  let locked =
+    Output {
+      address: Address {
+        payment_credential: Script(policy),
+        stake_credential: None,
+      },
+      value: merge(from_lovelace(escrow), from_asset(policy, d.token, 1)),
+      datum: InlineDatum(d),
+      reference_script: None,
+    }
+  Transaction {
+    ..placeholder,
+    inputs: [Input { output_reference: ref, output: locked }],
+    outputs: [to_key(supplier, payout), to_key(buyer, escrow - payout)],
+    mint: from_asset(policy, token, -1),
+    validity_range: range,
+    extra_signatories: signers,
+  }
+}
+
+/// For any of the four paths by which value leaves the escrow, and for any
+/// generated totals: if the validator accepts the transaction, the supplier
+/// received no more than `manifest_total`.
+///
+/// The payout is the amount each path actually settles, not a free variable.
+/// `settle` pins the payout to the amount owed exactly, so generating it
+/// independently means the validator almost never accepts and the implication
+/// holds vacuously — which is how the first version of this test passed while
+/// catching nothing. The one payout left free is the arbiter's ruling,
+/// because bounding that ruling is exactly what is under test.
+///
+/// The two free totals are folded into [0, 2 * manifest_total] so that about
+/// half of all generated cases are ones the validator MUST reject. That is a
+/// distribution choice, not a correctness crutch: the assertion still ranges
+/// over values well above the manifest.
+///
+/// Verified by mutation. Weakening `admissible` in `Declare`, or the
+/// `final_total <= manifest_total` bound in `Arbitrate`, each make this fail.
+test supplier_never_collects_more_than_its_manifest(
+  s via fuzz.tuple5(
+    fuzz.int_between(1_000_000, 100_000_000),
+    fuzz.int_between(0, 200_000_000),
+    fuzz.int_between(0, 10_000_000),
+    fuzz.int_between(0, 200_000_000),
+    fuzz.int_between(0, 3),
+  ),
+) {
+  let (manifest_total, wide_accepted, tolerance, wide_arbitrated, path) = s
+  let escrow = 400_000_000
+  let span = 2 * manifest_total + 1
+  let raw_accepted = wide_accepted % span
+  let arbitrated = wide_arbitrated % span
+
+  let sealed = Shipped { manifest: #"ee", manifest_total, shipped_at: 10_000 }
+
+  // A Disputed datum can only ever have been produced by `Declare`, which
+  // enforces `admissible`. Generating one where the buyer declared more than
+  // the manifest would test a state the ledger cannot reach, and would report
+  // a bug that does not exist.
+  let reachable_declared =
+    if raw_accepted > manifest_total {
+      manifest_total
+    } else {
+      raw_accepted
+    }
+  let contested =
+    Disputed {
+      manifest_total,
+      accepted_total: reachable_declared,
+      receipt: #"ff",
+      declared_at: 10_200,
+    }
+
+  // Keep `Declare` on its settling branch whatever the generated gap: the
+  // dispute branch parks the value at the script rather than paying it out,
+  // so it is not a path by which the supplier collects anything.
+  let gap = manifest_total - raw_accepted
+  let wide_enough =
+    if gap > tolerance {
+      gap
+    } else {
+      tolerance
+    }
+
+  let (d, action, range, signers, payout) =
+    if path == 0 {
+      (
+        order_with_tolerance(wide_enough, sealed),
+        Declare { receipt: #"ff", accepted_total: raw_accepted },
+        interval.between(10_100, 10_200),
+        [buyer],
+        raw_accepted,
+      )
+    } else if path == 1 {
+      (
+        order_with_tolerance(tolerance, sealed),
+        ClaimSilence,
+        interval.between(10_600, 10_700),
+        [supplier],
+        manifest_total,
+      )
+    } else if path == 2 {
+      (
+        order_with_tolerance(tolerance, contested),
+        Arbitrate { final_total: arbitrated },
+        interval.between(10_300, 10_400),
+        [arbiter],
+        arbitrated,
+      )
+    } else {
+      (
+        order_with_tolerance(tolerance, contested),
+        CloseDispute,
+        interval.between(11_300, 11_400),
+        [buyer],
+        reachable_declared,
+      )
+    }
+
+  let tx = settlement_tx(d, escrow, payout, range, signers)
+  let validator_accepts = order.spend(Some(d), action, ref, tx)
+
+  !validator_accepts || payout <= manifest_total
 }
