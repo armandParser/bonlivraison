@@ -1,7 +1,7 @@
 {
   "preamble": {
     "title": "resto/bonlivraison",
-    "description": "Aiken contracts for project 'resto/bonlivraison'",
+    "description": "Non-repudiable delivery-note attestations for food-service procurement, on Cardano.",
     "version": "0.0.0",
     "plutusVersion": "v3",
     "compiler": {

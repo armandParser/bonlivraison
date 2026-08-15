@@ -1,0 +1,5 @@
+# Aiken build output and vendored dependencies
+build/
+
+# macOS
+.DS_Store

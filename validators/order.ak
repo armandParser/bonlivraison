@@ -1259,3 +1259,210 @@ test deposit_must_be_returned_at_closing() fail {
     tx,
   )
 }
+
+// ### Transitions the brief asked for, and their positive controls
+//
+// `Accept` and the deadline branch of `Cancel` had no tests at all.
+
+/// The supplier commits before the deadline. Nominal.
+test acceptance_before_the_deadline() {
+  let created = Created { request: #"aa" }
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(min_ada, created)],
+      outputs: [to_script(min_ada, accepted_state)],
+      validity_range: interval.between(100, 200),
+      extra_signatories: [supplier],
+    }
+  order.spend(
+    Some(dat(created)),
+    Accept { lines: #"aa", total: 100_000 },
+    ref,
+    tx,
+  )
+}
+
+/// Past the acceptance deadline the supplier can no longer commit. The buyer
+/// must be able to walk away and re-order elsewhere at 6am.
+test acceptance_after_the_deadline_refused() fail {
+  let created = Created { request: #"aa" }
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(min_ada, created)],
+      outputs: [to_script(min_ada, accepted_state)],
+      validity_range: interval.between(20_100, 20_200),
+      extra_signatories: [supplier],
+    }
+  order.spend(
+    Some(dat(created)),
+    Accept { lines: #"aa", total: 100_000 },
+    ref,
+    tx,
+  )
+}
+
+/// The supplier cannot seal a manifest above what it accepted. Without this,
+/// a supplier could agree to 1000 EUR and invoice 1200 EUR after the fact.
+test shipment_above_the_accepted_total_refused() fail {
+  let after =
+    Shipped { manifest: #"ee", manifest_total: 120_000, shipped_at: 10_200 }
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(min_ada, accepted_state)],
+      outputs: [to_script(min_ada, after)],
+      validity_range: interval.between(10_000, 10_200),
+      extra_signatories: [supplier],
+    }
+  order.spend(
+    Some(dat(accepted_state)),
+    Ship { manifest: #"ee", manifest_total: 120_000 },
+    ref,
+    tx,
+  )
+}
+
+/// The supplier cannot cancel the buyer's order out from under it before the
+/// deadline. Only the buyer may withdraw while the offer is live.
+test supplier_cannot_cancel_before_the_deadline() fail {
+  let created = Created { request: #"aa" }
+  order.spend(
+    Some(dat(created)),
+    Cancel,
+    ref,
+    closing_tx(created, interval.between(100, 200), [supplier]),
+  )
+}
+
+/// Once the deadline has passed the order is dead, and anyone may close it to
+/// return the buyer's deposit. Exercises the second branch of the `or`.
+test anyone_can_cancel_after_the_deadline() {
+  let created = Created { request: #"aa" }
+  order.spend(
+    Some(dat(created)),
+    Cancel,
+    ref,
+    closing_tx(created, interval.between(20_100, 20_200), [outsider]),
+  )
+}
+
+// ### Continuation integrity
+//
+// `continues()` compares six fields between the spent datum and the one the
+// client proposes. The brief flagged that nothing proved the `terms` check.
+// It is worse than that: five of the six were unproven. Each of these
+// mutations is a distinct attack, and each is one line in `continues`.
+
+/// The honest continuation of a `Ship` out of `accepted_state`.
+fn honest_shipment() -> Order {
+  datum_of(
+    token,
+    Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 10_200 },
+  )
+}
+
+fn ship_action() -> Action {
+  Ship { manifest: #"ee", manifest_total: 80_000 }
+}
+
+/// A `Ship` whose continuing output carries whatever datum we hand it.
+fn ship_with_continuation(next: Order) -> Transaction {
+  Transaction {
+    ..placeholder,
+    inputs: [script_input(min_ada, accepted_state)],
+    outputs: [
+      Output {
+        address: Address {
+          payment_credential: Script(policy),
+          stake_credential: None,
+        },
+        value: merge(from_lovelace(min_ada), from_asset(policy, token, 1)),
+        datum: InlineDatum(next),
+        reference_script: None,
+      },
+    ],
+    validity_range: interval.between(10_000, 10_200),
+    extra_signatories: [supplier],
+  }
+}
+
+/// Positive control: an untampered continuation is accepted.
+test honest_continuation_is_accepted() {
+  order.spend(
+    Some(dat(accepted_state)),
+    ship_action(),
+    ref,
+    ship_with_continuation(honest_shipment()),
+  )
+}
+
+/// Renaming the state token would let the datum point at a different order.
+test continuation_cannot_change_the_token() fail {
+  order.spend(
+    Some(dat(accepted_state)),
+    ship_action(),
+    ref,
+    ship_with_continuation(Order { ..honest_shipment(), token: token_b }),
+  )
+}
+
+/// Swapping the buyer would redirect the deposit, and put someone else's name
+/// on the reception the restaurant is about to sign.
+test continuation_cannot_change_the_buyer() fail {
+  order.spend(
+    Some(dat(accepted_state)),
+    ship_action(),
+    ref,
+    ship_with_continuation(Order { ..honest_shipment(), buyer: outsider }),
+  )
+}
+
+/// Swapping the supplier would put the wrong party on the record as the one
+/// who sealed the manifest.
+test continuation_cannot_change_the_supplier() fail {
+  order.spend(
+    Some(dat(accepted_state)),
+    ship_action(),
+    ref,
+    ship_with_continuation(Order { ..honest_shipment(), supplier: outsider }),
+  )
+}
+
+/// The worst of the six. A supplier that could rewrite the panel mid-order
+/// would install keys it controls at a threshold of one, and then rule on its
+/// own dispute.
+test continuation_cannot_change_the_arbitration_panel() fail {
+  order.spend(
+    Some(dat(accepted_state)),
+    ship_action(),
+    ref,
+    ship_with_continuation(
+      Order {
+        ..honest_shipment(),
+        arbitration: Arbitration {
+          keys: [outsider, buyer, supplier],
+          threshold: 1,
+        },
+      },
+    ),
+  )
+}
+
+/// The one the brief named. Widening the tolerance from 15 EUR to 500 EUR
+/// would let a short delivery be absorbed silently, with no dispute raised
+/// and nothing on the record.
+test continuation_cannot_change_the_terms() fail {
+  order.spend(
+    Some(dat(accepted_state)),
+    ship_action(),
+    ref,
+    ship_with_continuation(
+      Order {
+        ..honest_shipment(),
+        terms: Terms { ..terms(), tolerance: 50_000 },
+      },
+    ),
+  )
+}
