@@ -40,22 +40,29 @@ validator order {
 
     let address = input.output.address
     expect Script(policy) = address.payment_credential
-    let escrow = lovelace_of(input.output.value)
+    // Not an escrow: only the min-ADA that lets this UTxO exist. It returns
+    // to the buyer when the order closes.
+    let deposit = lovelace_of(input.output.value)
 
     and {
-      // One order per transaction.
+      // One order per transaction. Three reasons, in order of weight.
       //
-      // `paid_to` and `token_burned` read the transaction as a whole, so two
-      // orders settled together would each be satisfied by the same outputs:
-      // a single payment to the supplier would discharge both, and the buyer
-      // would take a full delivery for free. Two orders from the same
-      // buyer/supplier pair on the same morning is the normal case in food
-      // service, not an edge case.
+      // 1. `paid_to` reads the transaction as a whole, not a flow attributable
+      //    to one order. Two orders closed together would both be discharged
+      //    by a single deposit refund, and whoever built the transaction would
+      //    pocket the other. That is only ~2 ADA per order rather than a whole
+      //    delivery, but two orders from the same buyer/supplier pair on the
+      //    same morning is the normal case in food service, not an edge case.
       //
-      // Batching is not a loss here. One order = one UTxO = one state token,
-      // so orders never contend for the same UTxO and there is nothing to
-      // batch for throughput. Wallet inputs funding the fee are unaffected:
-      // only inputs locked by this script are counted.
+      // 2. One transition, one transaction, one attestation. CIP-0170 counts
+      //    signed attestations carrying a declared identifier, so a batched
+      //    transaction would collapse several attestations into one counted
+      //    event.
+      //
+      // 3. Nothing is lost. One order = one UTxO = one state token, so orders
+      //    never contend for the same UTxO and there is no throughput reason
+      //    to batch. Wallet inputs funding the fee are unaffected: only inputs
+      //    locked by this script are counted.
       (script_input_count(self, policy) == 1)?,
       when action is {
         // --- The supplier commits ----------------------------------------
@@ -68,16 +75,13 @@ validator order {
               d.terms.acceptance_deadline,
             )?,
             (total > 0)?,
-            // The escrow must cover the commitment, otherwise the buyer could
-            // promise without provisioning.
-            (escrow >= total)?,
             continues(
               self,
               address,
               policy,
               d,
               Accepted { lines, total },
-              escrow,
+              deposit,
             )?,
           }
         }
@@ -94,9 +98,9 @@ validator order {
               ),
             }?,
             token_burned(self, policy, d.token)?,
-            // Full escrow back, fee on the canceller. Same reasoning as
-            // `settle`.
-            (paid_to(self, d.buyer) >= escrow)?,
+            // Deposit back in full, fee on the canceller. Same reasoning as
+            // `close_order`.
+            (paid_to(self, d.buyer) >= deposit)?,
           }
         }
 
@@ -123,7 +127,7 @@ validator order {
                 // ever opened.
                 shipped_at: event_time(self.validity_range),
               },
-              escrow,
+              deposit,
             )?,
           }
         }
@@ -142,8 +146,9 @@ validator order {
             }
 
           when reconcile(manifest_total, accepted_total, d.terms.tolerance) is {
-            // Significant gap: the undisputed part settles at closing, the
-            // delta stays in escrow for the duration of the arbitration.
+            // Significant gap: the order stays open and the two opposing
+            // figures stay on the record until the panel rules or the window
+            // expires.
             Contested -> and {
                 preconditions,
                 continues(
@@ -157,27 +162,29 @@ validator order {
                     receipt,
                     declared_at,
                   },
-                  escrow,
+                  deposit,
                 )?,
               }
-            // Exact or trivial: immediate settlement, no arbitration.
+            // Exact or trivial: close the record now, no arbitration.
             _ -> and {
                 preconditions,
-                settle(self, d, policy, accepted_total, escrow)?,
+                close_order(self, d, policy, deposit)?,
               }
           }
         }
 
         // --- The buyer's silence counts as acceptance ----------------------
         ClaimSilence -> {
-          expect Shipped { manifest_total, shipped_at, .. } = d.state
+          // The attested figure on this path is the sealed manifest itself.
+          // It is on the record in the datum; nothing needs to move.
+          expect Shipped { shipped_at, .. } = d.state
           and {
             signed_by(self, d.supplier)?,
             interval.is_entirely_after(
               self.validity_range,
               shipped_at + d.terms.reception_window,
             )?,
-            settle(self, d, policy, manifest_total, escrow)?,
+            close_order(self, d, policy, deposit)?,
           }
         }
 
@@ -193,13 +200,15 @@ validator order {
               self.validity_range,
               declared_at + d.terms.dispute_window,
             )?,
-            settle(self, d, policy, final_total, escrow)?,
+            close_order(self, d, policy, deposit)?,
           }
         }
 
         // --- The arbiter never ruled: the buyer prevails -------------------
         CloseDispute -> {
-          expect Disputed { accepted_total, declared_at, .. } = d.state
+          // The attested figure on this path is the buyer's declaration,
+          // already on the record in the datum.
+          expect Disputed { declared_at, .. } = d.state
           and {
             interval.is_entirely_after(
               self.validity_range,
@@ -209,7 +218,7 @@ validator order {
               signed_by(self, d.buyer),
               signed_by(self, d.supplier),
             }?,
-            settle(self, d, policy, accepted_total, escrow)?,
+            close_order(self, d, policy, deposit)?,
           }
         }
       },
@@ -272,7 +281,7 @@ fn continues(
   policy: PolicyId,
   previous: Order,
   new_state: State,
-  escrow: Int,
+  deposit: Int,
 ) -> Bool {
   let output = continuing_output(self, address, policy, previous.token)
   expect InlineDatum(raw) = output.datum
@@ -284,39 +293,40 @@ fn continues(
     (next.arbitration == previous.arbitration)?,
     (next.terms == previous.terms)?,
     (next.state == new_state)?,
-    // The escrow cannot leak along the way.
-    (lovelace_of(output.value) >= escrow)?,
+    // The deposit cannot leak along the way. It is only min-ADA, but it is
+    // the buyer's, and it must survive to be returned at closing.
+    (lovelace_of(output.value) >= deposit)?,
   }
 }
 
-/// Final closing: token burned, supplier paid, remainder returned in full.
+/// Final closing: the state token is burned and the deposit returns to the
+/// buyer.
 ///
-/// The escrow is accounted for exactly: the supplier receives what it is
-/// owed, the buyer receives the rest, and the transaction fee is paid by
-/// whoever submits, out of their own inputs.
+/// No money changes hands here, and none ever did. The figure each path put
+/// on the record — the buyer's declaration, the sealed manifest, the panel's
+/// ruling — is an attested amount in euro cents. Payment follows by SEPA
+/// transfer, off-chain. What this transaction leaves behind is the record.
 ///
-/// An earlier version allowed `paid_to(buyer) + self.fee`, so the fee could be
-/// charged against the buyer's refund. Value conservation caps the supplier's
-/// net take at `owed_to_supplier` either way, so that allowance never let the
-/// supplier steal outright — but it did let the supplier inflate the fee at
-/// zero cost to itself and shrink the buyer's refund by exactly that amount,
-/// on every supplier-initiated path. Small per delivery, and levied on every
-/// delivery, against the party this product exists to protect.
+/// The amount owed is therefore not a parameter: the bounds that matter are
+/// enforced where each figure is written (`admissible` in `Declare`, the two
+/// bounds in `Arbitrate`), not here.
 ///
-/// Removing it also serves the adoption metric: each party must pay its own
-/// fees from its own wallet, and a fee drawn from the buyer's escrow is not
-/// that.
-fn settle(
+/// The deposit returns in full, with the fee on whoever submits. An earlier
+/// version allowed `paid_to(buyer) + self.fee`, letting a supplier inflate the
+/// fee at zero cost to itself and take the difference out of the buyer's
+/// refund. Small per delivery, levied on every delivery, against the party
+/// this product exists to protect. It also broke the adoption metric: each
+/// party must pay its own fees from its own wallet, and a fee drawn from the
+/// buyer's deposit is not that.
+fn close_order(
   self: Transaction,
   d: Order,
   policy: PolicyId,
-  owed_to_supplier: Int,
-  escrow: Int,
+  deposit: Int,
 ) -> Bool {
   and {
     token_burned(self, policy, d.token)?,
-    (paid_to(self, d.supplier) >= owed_to_supplier)?,
-    (paid_to(self, d.buyer) >= escrow - owed_to_supplier)?,
+    (paid_to(self, d.buyer) >= deposit)?,
   }
 }
 
@@ -324,23 +334,25 @@ fn settle(
 //
 // End-to-end simulated transactions. Nominal paths matter, attempted abuse
 // matters more.
+//
+// Every total below is an ATTESTED FIGURE IN EURO CENTS. The only lovelace
+// figure is `min_ada`: the deposit that keeps the order UTxO alive and returns
+// to the buyer at closing.
 
 const buyer = #"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 
 const supplier = #"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
 
-const arbiter_a = #"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
-
-const arbiter_b = #"c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
-
-const arbiter_c = #"c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5"
+/// The independent seat on the arbitration panel.
+///
+/// The other two seats are the buyer and the supplier themselves. Two
+/// signatures rule, so the parties agreeing settles their own dispute, and
+/// this key only breaks a tie. The platform holds no seat at all — with a
+/// seat it could always swing a dispute by siding with one party, which is
+/// the neutrality problem the whole design exists to remove.
+const third_party = #"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
 
 const outsider = #"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-
-/// Default panel for the scenarios: 2 of 3.
-fn panel() -> Arbitration {
-  Arbitration { keys: [arbiter_a, arbiter_b, arbiter_c], threshold: 2 }
-}
 
 const policy = #"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
 
@@ -360,12 +372,20 @@ const ref_b =
     output_index: 1,
   }
 
+/// Min-ADA on the order UTxO. Not an escrow: the buyer gets it back.
+const min_ada: Int = 2_000_000
+
+fn panel() -> Arbitration {
+  Arbitration { keys: [buyer, supplier, third_party], threshold: 2 }
+}
+
 fn terms() -> Terms {
   Terms {
     acceptance_deadline: 20_000,
     reception_window: 500,
     dispute_window: 1_000,
-    tolerance: 1_500_000,
+    // 15 EUR
+    tolerance: 1_500,
   }
 }
 
@@ -384,29 +404,29 @@ fn dat(state: State) -> Order {
   datum_of(token, state)
 }
 
-fn to_script_with(t: ByteArray, escrow: Int, state: State) -> Output {
+fn to_script_with(t: ByteArray, lovelace: Int, state: State) -> Output {
   Output {
     address: Address {
       payment_credential: Script(policy),
       stake_credential: None,
     },
-    value: merge(from_lovelace(escrow), from_asset(policy, t, 1)),
+    value: merge(from_lovelace(lovelace), from_asset(policy, t, 1)),
     datum: InlineDatum(datum_of(t, state)),
     reference_script: None,
   }
 }
 
-fn to_script(escrow: Int, state: State) -> Output {
-  to_script_with(token, escrow, state)
+fn to_script(lovelace: Int, state: State) -> Output {
+  to_script_with(token, lovelace, state)
 }
 
-fn to_key(who: ByteArray, amount: Int) -> Output {
+fn to_key(who: ByteArray, lovelace: Int) -> Output {
   Output {
     address: Address {
       payment_credential: VerificationKey(who),
       stake_credential: None,
     },
-    value: from_lovelace(amount),
+    value: from_lovelace(lovelace),
     datum: NoDatum,
     reference_script: None,
   }
@@ -415,468 +435,438 @@ fn to_key(who: ByteArray, amount: Int) -> Output {
 fn script_input_with(
   r: OutputReference,
   t: ByteArray,
-  escrow: Int,
+  lovelace: Int,
   state: State,
 ) -> Input {
-  Input { output_reference: r, output: to_script_with(t, escrow, state) }
+  Input { output_reference: r, output: to_script_with(t, lovelace, state) }
 }
 
-fn script_input(escrow: Int, state: State) -> Input {
-  script_input_with(ref, token, escrow, state)
+fn script_input(lovelace: Int, state: State) -> Input {
+  script_input_with(ref, token, lovelace, state)
 }
 
+/// 800 EUR sealed against a 1000 EUR order.
 const shipped =
-  Shipped { manifest: #"ee", manifest_total: 80_000_000, shipped_at: 10_000 }
+  Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 10_000 }
+
+const accepted_state = Accepted { lines: #"aa", total: 100_000 }
+
+/// A closing transaction: token burned, deposit back to the buyer.
+fn closing_tx(
+  state: State,
+  range: Interval<Int>,
+  signers: List<VerificationKeyHash>,
+) -> Transaction {
+  Transaction {
+    ..placeholder,
+    inputs: [script_input(min_ada, state)],
+    outputs: [to_key(buyer, min_ada)],
+    mint: from_asset(policy, token, -1),
+    validity_range: range,
+    extra_signatories: signers,
+  }
+}
 
 // ### Nominal paths
 
-/// Everything arrived, the supplier is paid, the remainder returns.
-test nominal_settles_immediately() {
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 20_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_100, 10_200),
-      extra_signatories: [buyer],
-    }
+/// Everything arrived: the buyer attests the full manifest and the record
+/// closes. No value moves — the 800 EUR is paid by SEPA, off-chain.
+test nominal_closes_immediately() {
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 80_000_000 },
+    Declare { receipt: #"ff", accepted_total: 80_000 },
     ref,
-    tx,
+    closing_tx(shipped, interval.between(10_100, 10_200), [buyer]),
   )
 }
 
-/// Two missing leeks: below the threshold, credited without arbitration.
-test trivial_gap_settles_without_dispute() {
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 79_000_000), to_key(buyer, 21_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_100, 10_200),
-      extra_signatories: [buyer],
-    }
+/// Two missing leeks: 10 EUR short, below the 15 EUR threshold, credited
+/// without arbitration.
+test trivial_gap_closes_without_dispute() {
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 79_000_000 },
+    Declare { receipt: #"ff", accepted_total: 79_000 },
     ref,
-    tx,
+    closing_tx(shipped, interval.between(10_100, 10_200), [buyer]),
   )
 }
 
-/// Significant gap: the undisputed part is NOT paid out yet, the order moves
-/// to dispute and the escrow stays intact.
+/// A 200 EUR gap: the order stays open, both figures stay on the record, and
+/// the deposit stays put.
 test significant_gap_becomes_dispute() {
   let after =
     Disputed {
-      manifest_total: 80_000_000,
-      accepted_total: 60_000_000,
+      manifest_total: 80_000,
+      accepted_total: 60_000,
       receipt: #"ff",
       declared_at: 10_200,
     }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_script(100_000_000, after)],
+      inputs: [script_input(min_ada, shipped)],
+      outputs: [to_script(min_ada, after)],
       validity_range: interval.between(10_100, 10_200),
       extra_signatories: [buyer],
     }
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 60_000_000 },
+    Declare { receipt: #"ff", accepted_total: 60_000 },
     ref,
     tx,
   )
 }
 
-/// The buyer's silence counts as acceptance: past the window, the supplier
-/// collects its manifest.
+/// Past the window, the buyer's silence puts the sealed manifest on the
+/// record as the agreed figure.
 test silence_counts_as_acceptance() {
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 20_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_600, 10_700),
-      extra_signatories: [supplier],
-    }
-  order.spend(Some(dat(shipped)), ClaimSilence, ref, tx)
+  order.spend(
+    Some(dat(shipped)),
+    ClaimSilence,
+    ref,
+    closing_tx(shipped, interval.between(10_600, 10_700), [supplier]),
+  )
 }
 
-/// Silent arbiter: past the delay, the buyer's figure prevails.
-test silent_arbiter_lets_the_buyer_win() {
-  let dispute =
-    Disputed {
-      manifest_total: 80_000_000,
-      accepted_total: 60_000_000,
-      receipt: #"ff",
-      declared_at: 10_100,
-    }
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, dispute)],
-      outputs: [to_key(supplier, 60_000_000), to_key(buyer, 40_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(11_200, 11_300),
-      extra_signatories: [buyer],
-    }
-  order.spend(Some(dat(dispute)), CloseDispute, ref, tx)
+const dispute_case =
+  Disputed {
+    manifest_total: 80_000,
+    accepted_total: 60_000,
+    receipt: #"ff",
+    declared_at: 10_100,
+  }
+
+/// Nobody ruled in time: the buyer's figure stands.
+test silent_panel_lets_the_buyer_win() {
+  order.spend(
+    Some(dat(dispute_case)),
+    CloseDispute,
+    ref,
+    closing_tx(dispute_case, interval.between(11_200, 11_300), [buyer]),
+  )
+}
+
+/// The buyer opens, then withdraws before the supplier accepts. Deposit back.
+test buyer_can_cancel_before_acceptance() {
+  let created = Created { request: #"aa" }
+  order.spend(
+    Some(dat(created)),
+    Cancel,
+    ref,
+    closing_tx(created, interval.between(100, 200), [buyer]),
+  )
 }
 
 // ### Abuse attempts
 
 /// The supplier cannot claim before the end of the window.
 test premature_silence_refused() fail {
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 20_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_100, 10_200),
-      extra_signatories: [supplier],
-    }
-  order.spend(Some(dat(shipped)), ClaimSilence, ref, tx)
+  order.spend(
+    Some(dat(shipped)),
+    ClaimSilence,
+    ref,
+    closing_tx(shipped, interval.between(10_100, 10_200), [supplier]),
+  )
 }
 
 /// The supplier cannot declare reception in the buyer's place.
 test supplier_cannot_declare_reception() fail {
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 20_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_100, 10_200),
-      extra_signatories: [supplier],
-    }
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 80_000_000 },
+    Declare { receipt: #"ff", accepted_total: 80_000 },
     ref,
-    tx,
+    closing_tx(shipped, interval.between(10_100, 10_200), [supplier]),
   )
 }
 
-/// The buyer cannot get more back than it is owed by declaring a reception
-/// above the manifest.
+/// The buyer cannot attest receiving more than the supplier sealed. This is
+/// the min() rule, and it is the one arithmetic bound the chain enforces.
 test declaration_above_manifest_refused() fail {
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 90_000_000), to_key(buyer, 10_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_100, 10_200),
-      extra_signatories: [buyer],
-    }
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 90_000_000 },
+    Declare { receipt: #"ff", accepted_total: 90_000 },
     ref,
-    tx,
+    closing_tx(shipped, interval.between(10_100, 10_200), [buyer]),
   )
 }
 
-/// The supplier cannot siphon the escrow on the way into dispute.
-test escrow_cannot_leak_into_dispute() fail {
+/// The deposit cannot be siphoned on the way into dispute.
+test deposit_cannot_leak_into_dispute() fail {
   let after =
     Disputed {
-      manifest_total: 80_000_000,
-      accepted_total: 60_000_000,
+      manifest_total: 80_000,
+      accepted_total: 60_000,
       receipt: #"ff",
       declared_at: 10_200,
     }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_script(40_000_000, after), to_key(supplier, 60_000_000)],
+      inputs: [script_input(min_ada, shipped)],
+      outputs: [to_script(500_000, after), to_key(supplier, 1_500_000)],
       validity_range: interval.between(10_100, 10_200),
       extra_signatories: [buyer],
     }
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 60_000_000 },
+    Declare { receipt: #"ff", accepted_total: 60_000 },
     ref,
     tx,
   )
 }
 
-/// The arbiter cannot award the supplier more than its own manifest: its
-/// power is bounded on both sides.
-test arbiter_cannot_exceed_the_manifest() fail {
-  let dispute =
-    Disputed {
-      manifest_total: 80_000_000,
-      accepted_total: 60_000_000,
-      receipt: #"ff",
-      declared_at: 10_100,
-    }
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, dispute)],
-      outputs: [to_key(supplier, 95_000_000), to_key(buyer, 5_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_200, 10_300),
-      extra_signatories: [arbiter_a, arbiter_b],
-    }
+/// The panel cannot record a figure above the supplier's own manifest.
+test panel_cannot_exceed_the_manifest() fail {
   order.spend(
-    Some(dat(dispute)),
-    Arbitrate { final_total: 95_000_000 },
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 95_000 },
     ref,
-    tx,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
+  )
+}
+
+/// Nor below what the buyer already conceded.
+test panel_cannot_go_below_the_declaration() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 50_000 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
   )
 }
 
 // ### Timestamp forgery (regression tests for the `event_time` fix)
 //
-// Before the fix, `horodatage` read the LOWER bound of the validity range.
-// A transaction with `invalid_before = 0` is valid at any slot, so both
-// parties could write an arbitrary past timestamp and expire the deadline
-// that protected the other side. The five tests below are the ones that
-// previously passed as successful attacks.
-
-const accepted_state = Accepted { lines: #"aa", total: 100_000_000 }
+// Before the fix, the recorded timestamp read the LOWER bound of the validity
+// range. A transaction with `invalid_before = 0` is valid at any slot, so
+// either party could write an arbitrary past timestamp and expire the deadline
+// that protected the other side. With no money on the chain, this sequencing
+// is the entire product — these are the most important tests in the file.
 
 /// The recorded timestamp is the upper bound of the validity range.
 test shipment_timestamp_is_the_upper_bound() {
   let after =
-    Shipped { manifest: #"ee", manifest_total: 80_000_000, shipped_at: 10_200 }
+    Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 10_200 }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, accepted_state)],
-      outputs: [to_script(100_000_000, after)],
+      inputs: [script_input(min_ada, accepted_state)],
+      outputs: [to_script(min_ada, after)],
       validity_range: interval.between(10_000, 10_200),
       extra_signatories: [supplier],
     }
   order.spend(
     Some(dat(accepted_state)),
-    Ship { manifest: #"ee", manifest_total: 80_000_000 },
+    Ship { manifest: #"ee", manifest_total: 80_000 },
     ref,
     tx,
   )
 }
 
-/// ATTACK, now blocked: the supplier back-dates its shipment so that the
-/// buyer's reception window has already expired, then collects the full
-/// manifest through `ClaimSilence` without the buyer ever declaring.
+/// ATTACK, now blocked: the supplier back-dates its shipment so the buyer's
+/// reception window has already expired, then puts the full manifest on the
+/// record through `ClaimSilence` without the buyer ever declaring.
 test supplier_cannot_backdate_shipment() fail {
-  let after =
-    Shipped { manifest: #"ee", manifest_total: 80_000_000, shipped_at: 0 }
+  let after = Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 0 }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, accepted_state)],
-      outputs: [to_script(100_000_000, after)],
+      inputs: [script_input(min_ada, accepted_state)],
+      outputs: [to_script(min_ada, after)],
       validity_range: interval.between(0, 10_200),
       extra_signatories: [supplier],
     }
   order.spend(
     Some(dat(accepted_state)),
-    Ship { manifest: #"ee", manifest_total: 80_000_000 },
+    Ship { manifest: #"ee", manifest_total: 80_000 },
     ref,
     tx,
   )
 }
 
-/// ATTACK, now blocked: the buyer back-dates its declaration so that the
-/// arbitration window has already expired, then closes the dispute at its own
-/// figure. This one voided the arbiter entirely.
+/// ATTACK, now blocked: the buyer back-dates its declaration so the dispute
+/// window has already expired, then closes at its own figure. This one voided
+/// the panel entirely.
 test buyer_cannot_backdate_declaration() fail {
   let after =
     Disputed {
-      manifest_total: 80_000_000,
-      accepted_total: 10_000_000,
+      manifest_total: 80_000,
+      accepted_total: 10_000,
       receipt: #"ff",
       declared_at: 0,
     }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_script(100_000_000, after)],
+      inputs: [script_input(min_ada, shipped)],
+      outputs: [to_script(min_ada, after)],
       validity_range: interval.between(0, 10_400),
       extra_signatories: [buyer],
     }
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 10_000_000 },
+    Declare { receipt: #"ff", accepted_total: 10_000 },
     ref,
     tx,
   )
 }
 
-/// A timestamp cannot be recorded from an open-ended validity range: there
-/// would be no latest slot to pin it to.
+/// A timestamp cannot be recorded from an open-ended validity range.
 test unbounded_validity_range_refused() fail {
   let after =
-    Shipped { manifest: #"ee", manifest_total: 80_000_000, shipped_at: 10_200 }
+    Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 10_200 }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, accepted_state)],
-      outputs: [to_script(100_000_000, after)],
+      inputs: [script_input(min_ada, accepted_state)],
+      outputs: [to_script(min_ada, after)],
       validity_range: interval.after(10_000),
       extra_signatories: [supplier],
     }
   order.spend(
     Some(dat(accepted_state)),
-    Ship { manifest: #"ee", manifest_total: 80_000_000 },
+    Ship { manifest: #"ee", manifest_total: 80_000 },
     ref,
     tx,
   )
 }
 
 /// Nor from an absurdly wide one: forward-dating is the supplier's only
-/// remaining freedom, and it would lock the buyer's escrow for as long as it
-/// likes. `max_validity_span` caps it.
+/// remaining freedom, and it would hold the order open as long as it likes.
 test oversized_validity_range_refused() fail {
   let after =
-    Shipped {
-      manifest: #"ee",
-      manifest_total: 80_000_000,
-      shipped_at: 20_000_000,
-    }
+    Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 20_000_000 }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, accepted_state)],
-      outputs: [to_script(100_000_000, after)],
+      inputs: [script_input(min_ada, accepted_state)],
+      outputs: [to_script(min_ada, after)],
       validity_range: interval.between(0, 20_000_000),
       extra_signatories: [supplier],
     }
   order.spend(
     Some(dat(accepted_state)),
-    Ship { manifest: #"ee", manifest_total: 80_000_000 },
+    Ship { manifest: #"ee", manifest_total: 80_000 },
     ref,
     tx,
   )
 }
 
-/// The reception window now runs from the sealed upper-bound timestamp, so a
-/// claim at 10_600 against a shipment sealed at 10_200 is still premature.
+/// The reception window runs from the sealed upper-bound timestamp.
 test reception_window_runs_from_the_sealed_timestamp() fail {
   let sealed =
-    Shipped { manifest: #"ee", manifest_total: 80_000_000, shipped_at: 10_200 }
-  let tx =
-    Transaction {
-      ..placeholder,
-      inputs: [script_input(100_000_000, sealed)],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 20_000_000)],
-      mint: from_asset(policy, token, -1),
-      validity_range: interval.between(10_600, 10_700),
-      extra_signatories: [supplier],
-    }
-  order.spend(Some(dat(sealed)), ClaimSilence, ref, tx)
+    Shipped { manifest: #"ee", manifest_total: 80_000, shipped_at: 10_200 }
+  order.spend(
+    Some(dat(sealed)),
+    ClaimSilence,
+    ref,
+    closing_tx(sealed, interval.between(10_600, 10_700), [supplier]),
+  )
 }
 
 // ### Fee accounting (regression tests for the removed `self.fee` allowance)
 //
-// Every other test in this file runs on `placeholder`, where `fee` is zero,
-// so none of them exercise this. These set a real fee.
+// Every other test runs on `placeholder`, where `fee` is zero, so none of them
+// exercise this. These set a real fee. The amount at stake is now the min-ADA
+// deposit rather than an escrow — but at ~2 ADA per order it is larger than
+// the fee being griefed, and it comes out of the restaurant's pocket.
 
-/// ATTACK, now blocked: the supplier claims silence with a padded 3 ADA fee
-/// and hands the buyer only 17 ADA of the 20 it is owed. The 3 ADA came out
-/// of the buyer's refund; the supplier's own net take was unchanged, so it
-/// cost the supplier nothing to inflate.
+/// ATTACK, now blocked: the supplier claims silence with a padded fee and
+/// returns only part of the deposit. The shortfall came out of the buyer's
+/// refund; the supplier's own position was unchanged, so inflating cost it
+/// nothing.
 test supplier_cannot_charge_its_fee_to_the_buyer() fail {
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, shipped)],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 17_000_000)],
+      inputs: [script_input(min_ada, shipped)],
+      outputs: [to_key(buyer, 1_500_000)],
       mint: from_asset(policy, token, -1),
-      fee: 3_000_000,
+      fee: 500_000,
       validity_range: interval.between(10_600, 10_700),
       extra_signatories: [supplier],
     }
   order.spend(Some(dat(shipped)), ClaimSilence, ref, tx)
 }
 
-/// The correct construction: the supplier brings its own 5 ADA input, pays
-/// the 3 ADA fee from it, and the buyer still receives the full 20 ADA.
-/// The supplier nets 77 ADA on an 80 ADA claim — it bore its own fee.
+/// The correct construction: the supplier brings its own input and pays the
+/// fee from it. The buyer's deposit comes back whole.
 test supplier_funds_its_own_fee_on_a_silence_claim() {
   let funding =
     Input { output_reference: ref_b, output: to_key(supplier, 5_000_000) }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, shipped), funding],
-      outputs: [to_key(supplier, 82_000_000), to_key(buyer, 20_000_000)],
+      inputs: [script_input(min_ada, shipped), funding],
+      outputs: [to_key(buyer, min_ada), to_key(supplier, 4_500_000)],
       mint: from_asset(policy, token, -1),
-      fee: 3_000_000,
+      fee: 500_000,
       validity_range: interval.between(10_600, 10_700),
       extra_signatories: [supplier],
     }
   order.spend(Some(dat(shipped)), ClaimSilence, ref, tx)
 }
 
-/// The same allowance existed on `Cancel`: a refund short by the fee amount
-/// is no longer a full refund.
+/// The same allowance existed on `Cancel`.
 test cancellation_refund_is_not_reduced_by_the_fee() fail {
   let created = Created { request: #"aa" }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, created)],
-      outputs: [to_key(buyer, 97_000_000)],
+      inputs: [script_input(min_ada, created)],
+      outputs: [to_key(buyer, 1_500_000)],
       mint: from_asset(policy, token, -1),
-      fee: 3_000_000,
+      fee: 500_000,
       validity_range: interval.between(100, 200),
       extra_signatories: [buyer],
     }
   order.spend(Some(dat(created)), Cancel, ref, tx)
 }
 
-// ### Double satisfaction (regression tests for the one-order-per-tx rule)
+// ### One order per transaction
 
-/// A wallet input funding the fee is not a script input, so ordinary
-/// settlement still works. This is the test that proves the fix is not
-/// over-restrictive.
+/// A wallet input funding the fee is not a script input, so ordinary closing
+/// still works. This proves the rule is not over-restrictive.
 test wallet_input_alongside_the_order_is_fine() {
   let funding =
     Input { output_reference: ref_b, output: to_key(buyer, 5_000_000) }
   let tx =
     Transaction {
       ..placeholder,
-      inputs: [script_input(100_000_000, shipped), funding],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 25_000_000)],
+      inputs: [script_input(min_ada, shipped), funding],
+      outputs: [to_key(buyer, 7_000_000)],
       mint: from_asset(policy, token, -1),
       validity_range: interval.between(10_100, 10_200),
       extra_signatories: [buyer],
     }
   order.spend(
     Some(dat(shipped)),
-    Declare { receipt: #"ff", accepted_total: 80_000_000 },
+    Declare { receipt: #"ff", accepted_total: 80_000 },
     ref,
     tx,
   )
 }
 
-/// ATTACK, now blocked: two orders from the same buyer/supplier pair settled
-/// in one transaction. `paid_to` counts OUTPUTS, not per-order flow, so a
-/// single 80 ADA payment used to satisfy both validator invocations — the
-/// supplier delivered 160 ADA of goods and collected 80.
+/// ATTACK, now blocked: two orders closed in one transaction, both discharged
+/// by a single deposit refund. Whoever built it pockets the other deposit —
+/// and two attestations collapse into one counted transaction.
 test double_satisfaction_refused() fail {
   let tx =
     Transaction {
       ..placeholder,
       inputs: [
-        script_input_with(ref, token, 100_000_000, shipped),
-        script_input_with(ref_b, token_b, 100_000_000, shipped),
+        script_input_with(ref, token, min_ada, shipped),
+        script_input_with(ref_b, token_b, min_ada, shipped),
       ],
-      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 120_000_000)],
+      outputs: [to_key(buyer, min_ada)],
       mint: merge(
         from_asset(policy, token, -1),
         from_asset(policy, token_b, -1),
@@ -887,26 +877,159 @@ test double_satisfaction_refused() fail {
   and {
     order.spend(
       Some(datum_of(token, shipped)),
-      Declare { receipt: #"ff", accepted_total: 80_000_000 },
+      Declare { receipt: #"ff", accepted_total: 80_000 },
       ref,
       tx,
     ),
     order.spend(
       Some(datum_of(token_b, shipped)),
-      Declare { receipt: #"ff", accepted_total: 80_000_000 },
+      Declare { receipt: #"ff", accepted_total: 80_000 },
       ref_b,
       tx,
     ),
   }
 }
 
+// ### Arbitration panel (2-of-3: buyer, supplier, independent third party)
+
+/// The two parties agree. No third party needed, and none involved.
+test the_two_parties_can_settle_their_own_dispute() {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
+  )
+}
+
+/// They disagree, so the independent seat breaks the tie with the supplier.
+test the_third_party_can_break_a_tie() {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 75_000 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [supplier, third_party],
+    ),
+  )
+}
+
+/// No single seat can rule alone. This is the whole point: with the platform
+/// holding no key, and neither party able to act unilaterally, nobody can
+/// decide a dispute on their own.
+test one_seat_alone_cannot_rule() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000 },
+    ref,
+    closing_tx(dispute_case, interval.between(10_200, 10_300), [supplier]),
+  )
+}
+
+/// Padding the signature list with keys outside the panel reaches nothing.
+test signatures_outside_the_panel_do_not_count() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [supplier, outsider, third_party_impostor()],
+    ),
+  )
+}
+
+fn third_party_impostor() -> VerificationKeyHash {
+  #"dddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+}
+
+// ### Panel well-formedness, checked at minting
+//
+// Also the first tests of the `Open` handler, which previously had none.
+
+fn open_tx(arbitration: Arbitration) -> Transaction {
+  let seed = ref_b
+  let name = token_name(seed)
+  let born =
+    Output {
+      address: Address {
+        payment_credential: Script(policy),
+        stake_credential: None,
+      },
+      value: merge(from_lovelace(min_ada), from_asset(policy, name, 1)),
+      datum: InlineDatum(
+        Order {
+          token: name,
+          buyer,
+          supplier,
+          arbitration,
+          terms: terms(),
+          state: Created { request: #"aa" },
+        },
+      ),
+      reference_script: None,
+    }
+  Transaction {
+    ..placeholder,
+    inputs: [
+      Input { output_reference: seed, output: to_key(buyer, 10_000_000) },
+    ],
+    outputs: [born],
+    mint: from_asset(policy, name, 1),
+  }
+}
+
+/// Nominal opening: seed consumed, token derived from it, panel well formed.
+test order_opens_with_a_well_formed_panel() {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(Arbitration { keys: [buyer, supplier, third_party], threshold: 2 }),
+  )
+}
+
+/// A zero threshold would let anyone rule on a dispute.
+test zero_threshold_panel_refused() fail {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(Arbitration { keys: [buyer, supplier, third_party], threshold: 0 }),
+  )
+}
+
+/// A threshold above the panel size makes ruling impossible, stranding every
+/// dispute on the timeout path where the buyer's figure wins by default.
+test threshold_above_panel_size_refused() fail {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(Arbitration { keys: [buyer, supplier], threshold: 3 }),
+  )
+}
+
+/// Duplicate keys would let one seat's signature count twice, turning a
+/// nominal 2-of-3 into a seat that rules alone.
+test duplicate_panel_keys_refused() fail {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(Arbitration { keys: [buyer, buyer, third_party], threshold: 2 }),
+  )
+}
+
 // ### The security invariant, as a property
 //
-// The supplier can never collect more than the manifest it sealed itself,
-// whichever path the order takes out of escrow. Everything else in this
-// contract is machinery; this is the promise.
+// The record can never carry a figure against the supplier larger than the
+// manifest the supplier sealed itself, whichever path the order takes. With
+// no money on the chain, this is the promise in full.
 
-/// Builds an order datum with a chosen tolerance, all else fixed.
 fn order_with_tolerance(tolerance: Int, state: State) -> Order {
   Order {
     token,
@@ -923,66 +1046,32 @@ fn order_with_tolerance(tolerance: Int, state: State) -> Order {
   }
 }
 
-/// A settling transaction: order in, token burned, supplier and buyer paid.
-fn settlement_tx(
-  d: Order,
-  escrow: Int,
-  payout: Int,
-  range: Interval<Int>,
-  signers: List<VerificationKeyHash>,
-) -> Transaction {
-  let locked =
-    Output {
-      address: Address {
-        payment_credential: Script(policy),
-        stake_credential: None,
-      },
-      value: merge(from_lovelace(escrow), from_asset(policy, d.token, 1)),
-      datum: InlineDatum(d),
-      reference_script: None,
-    }
-  Transaction {
-    ..placeholder,
-    inputs: [Input { output_reference: ref, output: locked }],
-    outputs: [to_key(supplier, payout), to_key(buyer, escrow - payout)],
-    mint: from_asset(policy, token, -1),
-    validity_range: range,
-    extra_signatories: signers,
-  }
-}
-
-/// For any of the four paths by which value leaves the escrow, and for any
-/// generated totals: if the validator accepts the transaction, the supplier
-/// received no more than `manifest_total`.
+/// For any of the four paths that close an order, and for any generated
+/// totals: if the validator accepts, the figure that path puts on the record
+/// is no greater than `manifest_total`.
 ///
-/// The payout is the amount each path actually settles, not a free variable.
-/// `settle` pins the payout to the amount owed exactly, so generating it
-/// independently means the validator almost never accepts and the implication
-/// holds vacuously — which is how the first version of this test passed while
-/// catching nothing. The one payout left free is the arbiter's ruling,
-/// because bounding that ruling is exactly what is under test.
-///
-/// The two free totals are folded into [0, 2 * manifest_total] so that about
-/// half of all generated cases are ones the validator MUST reject. That is a
-/// distribution choice, not a correctness crutch: the assertion still ranges
-/// over values well above the manifest.
+/// The attested figure is the amount each path actually records, not a free
+/// variable — generating it independently would mean the validator almost
+/// never accepts and the implication would hold vacuously, which is how the
+/// first version of this test passed while catching nothing. The one figure
+/// left free is the panel's ruling, because bounding that ruling is exactly
+/// what is under test.
 ///
 /// Verified by mutation. Weakening `admissible` in `Declare`, or the
 /// `final_total <= manifest_total` bound in `Arbitrate`, each make this fail.
-test supplier_never_collects_more_than_its_manifest(
+test attested_total_never_exceeds_the_manifest(
   s via fuzz.tuple5(
-    fuzz.int_between(1_000_000, 100_000_000),
-    fuzz.int_between(0, 200_000_000),
-    fuzz.int_between(0, 10_000_000),
-    fuzz.int_between(0, 200_000_000),
+    fuzz.int_between(1_000, 10_000_000),
+    fuzz.int_between(0, 20_000_000),
+    fuzz.int_between(0, 5_000),
+    fuzz.int_between(0, 20_000_000),
     fuzz.int_between(0, 3),
   ),
 ) {
-  let (manifest_total, wide_accepted, tolerance, wide_arbitrated, path) = s
-  let escrow = 400_000_000
+  let (manifest_total, wide_accepted, tolerance, wide_ruling, path) = s
   let span = 2 * manifest_total + 1
   let raw_accepted = wide_accepted % span
-  let arbitrated = wide_arbitrated % span
+  let ruling = wide_ruling % span
 
   let sealed = Shipped { manifest: #"ee", manifest_total, shipped_at: 10_000 }
 
@@ -1004,9 +1093,9 @@ test supplier_never_collects_more_than_its_manifest(
       declared_at: 10_200,
     }
 
-  // Keep `Declare` on its settling branch whatever the generated gap: the
-  // dispute branch parks the value at the script rather than paying it out,
-  // so it is not a path by which the supplier collects anything.
+  // Keep `Declare` on its closing branch whatever the generated gap: the
+  // dispute branch leaves the order open rather than recording a final
+  // figure, so it is not a path that closes anything.
   let gap = manifest_total - raw_accepted
   let wide_enough =
     if gap > tolerance {
@@ -1015,7 +1104,7 @@ test supplier_never_collects_more_than_its_manifest(
       tolerance
     }
 
-  let (d, action, range, signers, payout) =
+  let (d, action, range, signers, attested) =
     if path == 0 {
       (
         order_with_tolerance(wide_enough, sealed),
@@ -1035,10 +1124,10 @@ test supplier_never_collects_more_than_its_manifest(
     } else if path == 2 {
       (
         order_with_tolerance(tolerance, contested),
-        Arbitrate { final_total: arbitrated },
+        Arbitrate { final_total: ruling },
         interval.between(10_300, 10_400),
-        [arbiter_a, arbiter_b],
-        arbitrated,
+        [buyer, supplier],
+        ruling,
       )
     } else {
       (
@@ -1050,158 +1139,123 @@ test supplier_never_collects_more_than_its_manifest(
       )
     }
 
-  let tx = settlement_tx(d, escrow, payout, range, signers)
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [
+        Input {
+          output_reference: ref,
+          output: Output {
+            address: Address {
+              payment_credential: Script(policy),
+              stake_credential: None,
+            },
+            value: merge(from_lovelace(min_ada), from_asset(policy, token, 1)),
+            datum: InlineDatum(d),
+            reference_script: None,
+          },
+        },
+      ],
+      outputs: [to_key(buyer, min_ada)],
+      mint: from_asset(policy, token, -1),
+      validity_range: range,
+      extra_signatories: signers,
+    }
   let validator_accepts = order.spend(Some(d), action, ref, tx)
 
-  !validator_accepts || payout <= manifest_total
+  !validator_accepts || attested <= manifest_total
 }
 
-// ### Arbitration panel (M-of-N)
-
-const dispute_case =
-  Disputed {
-    manifest_total: 80_000_000,
-    accepted_total: 60_000_000,
-    receipt: #"ff",
-    declared_at: 10_100,
-  }
-
-fn ruling_tx(
-  signers: List<VerificationKeyHash>,
-  final_total: Int,
-) -> Transaction {
-  Transaction {
-    ..placeholder,
-    inputs: [script_input(100_000_000, dispute_case)],
-    outputs: [
-      to_key(supplier, final_total),
-      to_key(buyer, 100_000_000 - final_total),
-    ],
-    mint: from_asset(policy, token, -1),
-    validity_range: interval.between(10_200, 10_300),
-    extra_signatories: signers,
-  }
-}
-
-/// Two of three is the configured threshold.
-test two_of_three_arbiters_can_rule() {
-  order.spend(
-    Some(dat(dispute_case)),
-    Arbitrate { final_total: 70_000_000 },
-    ref,
-    ruling_tx([arbiter_a, arbiter_b], 70_000_000),
-  )
-}
-
-/// Unanimity also clears the threshold.
-test three_of_three_arbiters_can_rule() {
-  order.spend(
-    Some(dat(dispute_case)),
-    Arbitrate { final_total: 70_000_000 },
-    ref,
-    ruling_tx([arbiter_a, arbiter_b, arbiter_c], 70_000_000),
-  )
-}
-
-/// A single arbiter cannot rule alone. This is the whole point of the change:
-/// no one key holder — the platform included — can decide a dispute.
-test one_of_three_arbiters_cannot_rule() fail {
-  order.spend(
-    Some(dat(dispute_case)),
-    Arbitrate { final_total: 70_000_000 },
-    ref,
-    ruling_tx([arbiter_a], 70_000_000),
-  )
-}
-
-/// Padding the signature list with keys outside the panel does not reach the
-/// threshold, however many of them there are.
-test signatures_outside_the_panel_do_not_count() fail {
-  order.spend(
-    Some(dat(dispute_case)),
-    Arbitrate { final_total: 70_000_000 },
-    ref,
-    ruling_tx([arbiter_a, outsider, buyer, supplier], 70_000_000),
-  )
-}
-
-// ### Panel well-formedness, checked at minting
+// ### Boundary tests
 //
-// These are also the first tests of the `Open` handler, which previously had
-// none.
+// A property test ranges widely but lands on exact boundaries only by luck.
+// Once totals are euro cents, `tolerance` (15 EUR) is tiny next to
+// `manifest_total` (800 EUR), so a bound widened by exactly the tolerance sits
+// in a window the fuzzer will essentially never hit. These pin the boundaries
+// directly.
 
-fn open_tx(arbitration: Arbitration) -> Transaction {
-  let seed = ref_b
-  let name = token_name(seed)
-  let born =
-    Output {
-      address: Address {
-        payment_credential: Script(policy),
-        stake_credential: None,
-      },
-      value: merge(from_lovelace(100_000_000), from_asset(policy, name, 1)),
-      datum: InlineDatum(
-        Order {
-          token: name,
-          buyer,
-          supplier,
-          arbitration,
-          terms: terms(),
-          state: Created { request: #"aa" },
-        },
-      ),
-      reference_script: None,
+/// One cent above the sealed manifest is already too much.
+test panel_cannot_exceed_the_manifest_by_one_cent() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 80_001 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
+  )
+}
+
+/// Exactly the manifest is fine: the panel may side entirely with the supplier.
+test panel_may_rule_exactly_the_manifest() {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 80_000 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
+  )
+}
+
+/// One cent below what the buyer already conceded is too little.
+test panel_cannot_go_below_the_declaration_by_one_cent() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 59_999 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
+  )
+}
+
+/// Exactly the declaration is fine: the panel may side entirely with the buyer.
+test panel_may_rule_exactly_the_declaration() {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 60_000 },
+    ref,
+    closing_tx(
+      dispute_case,
+      interval.between(10_200, 10_300),
+      [buyer, supplier],
+    ),
+  )
+}
+
+/// One cent above the manifest is refused on the buyer's own declaration too.
+test declaration_one_cent_above_the_manifest_refused() fail {
+  order.spend(
+    Some(dat(shipped)),
+    Declare { receipt: #"ff", accepted_total: 80_001 },
+    ref,
+    closing_tx(shipped, interval.between(10_100, 10_200), [buyer]),
+  )
+}
+
+/// The deposit belongs to the buyer. Closing an order without returning it —
+/// here, handing it to the supplier instead — is refused.
+test deposit_must_be_returned_at_closing() fail {
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(min_ada, shipped)],
+      outputs: [to_key(supplier, min_ada)],
+      mint: from_asset(policy, token, -1),
+      validity_range: interval.between(10_100, 10_200),
+      extra_signatories: [buyer],
     }
-  Transaction {
-    ..placeholder,
-    inputs: [
-      Input { output_reference: seed, output: to_key(buyer, 150_000_000) },
-    ],
-    outputs: [born],
-    mint: from_asset(policy, name, 1),
-  }
-}
-
-/// Nominal opening: seed consumed, token derived from it, panel well formed.
-test order_opens_with_a_well_formed_panel() {
-  order.mint(
-    Open { seed: ref_b },
-    policy,
-    open_tx(
-      Arbitration { keys: [arbiter_a, arbiter_b, arbiter_c], threshold: 2 },
-    ),
-  )
-}
-
-/// A zero threshold would let anyone rule on a dispute.
-test zero_threshold_panel_refused() fail {
-  order.mint(
-    Open { seed: ref_b },
-    policy,
-    open_tx(
-      Arbitration { keys: [arbiter_a, arbiter_b, arbiter_c], threshold: 0 },
-    ),
-  )
-}
-
-/// A threshold above the panel size makes ruling impossible, stranding every
-/// dispute on the timeout path.
-test threshold_above_panel_size_refused() fail {
-  order.mint(
-    Open { seed: ref_b },
-    policy,
-    open_tx(Arbitration { keys: [arbiter_a, arbiter_b], threshold: 3 }),
-  )
-}
-
-/// Duplicate keys would let one arbiter's signature count twice, turning a
-/// nominal 2-of-3 into a 1-of-2 they control alone.
-test duplicate_panel_keys_refused() fail {
-  order.mint(
-    Open { seed: ref_b },
-    policy,
-    open_tx(
-      Arbitration { keys: [arbiter_a, arbiter_a, arbiter_b], threshold: 2 },
-    ),
+  order.spend(
+    Some(dat(shipped)),
+    Declare { receipt: #"ff", accepted_total: 80_000 },
+    ref,
+    tx,
   )
 }
