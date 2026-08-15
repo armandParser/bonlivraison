@@ -21,6 +21,34 @@ pub fn signed_by(self: Transaction, who: VerificationKeyHash) -> Bool {
   list.has(self.extra_signatories, who)
 }
 
+/// How many of these keys signed the transaction.
+///
+/// Counts keys, not signatures, so it is only a threshold count if the key
+/// list is free of duplicates — enforced at minting by `well_formed_panel`.
+pub fn signature_count(
+  self: Transaction,
+  keys: List<VerificationKeyHash>,
+) -> Int {
+  list.count(keys, fn(k) { list.has(self.extra_signatories, k) })
+}
+
+/// Is an arbitration panel usable? Distinct keys, and a threshold that is
+/// neither trivially met nor impossible to reach.
+///
+/// A threshold of 0 would let anyone rule. A threshold above the panel size
+/// would make ruling impossible, stranding every dispute on the timeout path
+/// where the buyer's figure wins by default.
+pub fn well_formed_panel(
+  keys: List<VerificationKeyHash>,
+  threshold: Int,
+) -> Bool {
+  and {
+    (threshold >= 1)?,
+    (threshold <= list.length(keys))?,
+    (list.length(list.unique(keys)) == list.length(keys))?,
+  }
+}
+
 /// Number of inputs in this transaction locked by the given script.
 ///
 /// Used to enforce one order per transaction. See `paid_to` for why that

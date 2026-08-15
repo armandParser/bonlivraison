@@ -11,13 +11,13 @@ use aiken/fuzz
 use aiken/interval.{Interval}
 use bonlivraison/reconciliation.{Contested, admissible, reconcile}
 use bonlivraison/tx.{
-  continuing_output, event_time, paid_to, script_input_count, signed_by,
-  token_burned, token_name,
+  continuing_output, event_time, paid_to, script_input_count, signature_count,
+  signed_by, token_burned, token_name, well_formed_panel,
 }
 use bonlivraison/types.{
-  Accept, Accepted, Action, Arbitrate, Cancel, ClaimSilence, Close, CloseDispute,
-  Created, Declare, Disputed, Open, Order, Ship, Shipped, State, Terms,
-  TokenAction,
+  Accept, Accepted, Action, Arbitrate, Arbitration, Cancel, ClaimSilence, Close,
+  CloseDispute, Created, Declare, Disputed, Open, Order, Ship, Shipped, State,
+  Terms, TokenAction,
 }
 use cardano/address.{Address, Script, VerificationKey}
 use cardano/assets.{
@@ -186,7 +186,7 @@ validator order {
           expect Disputed { manifest_total, accepted_total, declared_at, .. } =
             d.state
           and {
-            signed_by(self, d.arbiter)?,
+            (signature_count(self, d.arbitration.keys) >= d.arbitration.threshold)?,
             (final_total >= accepted_total)?,
             (final_total <= manifest_total)?,
             interval.is_entirely_before(
@@ -244,6 +244,10 @@ validator order {
         and {
           (name == expected)?,
           (d.token == expected)?,
+          // The only point where this datum is created rather than carried
+          // forward by `continues`, so the only place a malformed arbitration
+          // panel can be caught.
+          well_formed_panel(d.arbitration.keys, d.arbitration.threshold)?,
         }
       }
 
@@ -277,7 +281,7 @@ fn continues(
     (next.token == previous.token)?,
     (next.buyer == previous.buyer)?,
     (next.supplier == previous.supplier)?,
-    (next.arbiter == previous.arbiter)?,
+    (next.arbitration == previous.arbitration)?,
     (next.terms == previous.terms)?,
     (next.state == new_state)?,
     // The escrow cannot leak along the way.
@@ -325,7 +329,18 @@ const buyer = #"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 
 const supplier = #"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
 
-const arbiter = #"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+const arbiter_a = #"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+
+const arbiter_b = #"c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+
+const arbiter_c = #"c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5"
+
+const outsider = #"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+/// Default panel for the scenarios: 2 of 3.
+fn panel() -> Arbitration {
+  Arbitration { keys: [arbiter_a, arbiter_b, arbiter_c], threshold: 2 }
+}
 
 const policy = #"d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
 
@@ -355,7 +370,14 @@ fn terms() -> Terms {
 }
 
 fn datum_of(t: ByteArray, state: State) -> Order {
-  Order { token: t, buyer, supplier, arbiter, terms: terms(), state }
+  Order {
+    token: t,
+    buyer,
+    supplier,
+    arbitration: panel(),
+    terms: terms(),
+    state,
+  }
 }
 
 fn dat(state: State) -> Order {
@@ -605,7 +627,7 @@ test arbiter_cannot_exceed_the_manifest() fail {
       outputs: [to_key(supplier, 95_000_000), to_key(buyer, 5_000_000)],
       mint: from_asset(policy, token, -1),
       validity_range: interval.between(10_200, 10_300),
-      extra_signatories: [arbiter],
+      extra_signatories: [arbiter_a, arbiter_b],
     }
   order.spend(
     Some(dat(dispute)),
@@ -890,7 +912,7 @@ fn order_with_tolerance(tolerance: Int, state: State) -> Order {
     token,
     buyer,
     supplier,
-    arbiter,
+    arbitration: panel(),
     terms: Terms {
       acceptance_deadline: 20_000,
       reception_window: 500,
@@ -1015,7 +1037,7 @@ test supplier_never_collects_more_than_its_manifest(
         order_with_tolerance(tolerance, contested),
         Arbitrate { final_total: arbitrated },
         interval.between(10_300, 10_400),
-        [arbiter],
+        [arbiter_a, arbiter_b],
         arbitrated,
       )
     } else {
@@ -1032,4 +1054,154 @@ test supplier_never_collects_more_than_its_manifest(
   let validator_accepts = order.spend(Some(d), action, ref, tx)
 
   !validator_accepts || payout <= manifest_total
+}
+
+// ### Arbitration panel (M-of-N)
+
+const dispute_case =
+  Disputed {
+    manifest_total: 80_000_000,
+    accepted_total: 60_000_000,
+    receipt: #"ff",
+    declared_at: 10_100,
+  }
+
+fn ruling_tx(
+  signers: List<VerificationKeyHash>,
+  final_total: Int,
+) -> Transaction {
+  Transaction {
+    ..placeholder,
+    inputs: [script_input(100_000_000, dispute_case)],
+    outputs: [
+      to_key(supplier, final_total),
+      to_key(buyer, 100_000_000 - final_total),
+    ],
+    mint: from_asset(policy, token, -1),
+    validity_range: interval.between(10_200, 10_300),
+    extra_signatories: signers,
+  }
+}
+
+/// Two of three is the configured threshold.
+test two_of_three_arbiters_can_rule() {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000_000 },
+    ref,
+    ruling_tx([arbiter_a, arbiter_b], 70_000_000),
+  )
+}
+
+/// Unanimity also clears the threshold.
+test three_of_three_arbiters_can_rule() {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000_000 },
+    ref,
+    ruling_tx([arbiter_a, arbiter_b, arbiter_c], 70_000_000),
+  )
+}
+
+/// A single arbiter cannot rule alone. This is the whole point of the change:
+/// no one key holder — the platform included — can decide a dispute.
+test one_of_three_arbiters_cannot_rule() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000_000 },
+    ref,
+    ruling_tx([arbiter_a], 70_000_000),
+  )
+}
+
+/// Padding the signature list with keys outside the panel does not reach the
+/// threshold, however many of them there are.
+test signatures_outside_the_panel_do_not_count() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Arbitrate { final_total: 70_000_000 },
+    ref,
+    ruling_tx([arbiter_a, outsider, buyer, supplier], 70_000_000),
+  )
+}
+
+// ### Panel well-formedness, checked at minting
+//
+// These are also the first tests of the `Open` handler, which previously had
+// none.
+
+fn open_tx(arbitration: Arbitration) -> Transaction {
+  let seed = ref_b
+  let name = token_name(seed)
+  let born =
+    Output {
+      address: Address {
+        payment_credential: Script(policy),
+        stake_credential: None,
+      },
+      value: merge(from_lovelace(100_000_000), from_asset(policy, name, 1)),
+      datum: InlineDatum(
+        Order {
+          token: name,
+          buyer,
+          supplier,
+          arbitration,
+          terms: terms(),
+          state: Created { request: #"aa" },
+        },
+      ),
+      reference_script: None,
+    }
+  Transaction {
+    ..placeholder,
+    inputs: [
+      Input { output_reference: seed, output: to_key(buyer, 150_000_000) },
+    ],
+    outputs: [born],
+    mint: from_asset(policy, name, 1),
+  }
+}
+
+/// Nominal opening: seed consumed, token derived from it, panel well formed.
+test order_opens_with_a_well_formed_panel() {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(
+      Arbitration { keys: [arbiter_a, arbiter_b, arbiter_c], threshold: 2 },
+    ),
+  )
+}
+
+/// A zero threshold would let anyone rule on a dispute.
+test zero_threshold_panel_refused() fail {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(
+      Arbitration { keys: [arbiter_a, arbiter_b, arbiter_c], threshold: 0 },
+    ),
+  )
+}
+
+/// A threshold above the panel size makes ruling impossible, stranding every
+/// dispute on the timeout path.
+test threshold_above_panel_size_refused() fail {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(Arbitration { keys: [arbiter_a, arbiter_b], threshold: 3 }),
+  )
+}
+
+/// Duplicate keys would let one arbiter's signature count twice, turning a
+/// nominal 2-of-3 into a 1-of-2 they control alone.
+test duplicate_panel_keys_refused() fail {
+  order.mint(
+    Open { seed: ref_b },
+    policy,
+    open_tx(
+      Arbitration { keys: [arbiter_a, arbiter_a, arbiter_b], threshold: 2 },
+    ),
+  )
 }

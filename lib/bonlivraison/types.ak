@@ -16,6 +16,25 @@ use cardano/transaction.{OutputReference}
 pub type Commitment =
   ByteArray
 
+/// Arbitration panel: an M-of-N set of keys entitled to rule on a dispute.
+///
+/// A single arbiter key would make whoever holds it the trusted third party
+/// this design exists to remove — and if it were the platform's own key, the
+/// platform would be arbitrating disputes over a record it also profits from.
+/// A threshold across independent holders is what makes the record adoptable
+/// by suppliers who have no reason to trust the platform.
+///
+/// Well-formedness (distinct keys, `1 <= threshold <= length(keys)`) is
+/// enforced once, at minting, because that is the only point where this
+/// datum is created rather than carried forward by `continues`.
+pub type Arbitration {
+  /// Distinct verification keys. Duplicates would let one signature count
+  /// more than once towards the threshold.
+  keys: List<VerificationKeyHash>,
+  /// Minimum number of distinct panel signatures required to rule.
+  threshold: Int,
+}
+
 /// Contractual parameters, frozen at creation and never mutable afterwards.
 pub type Terms {
   /// Deadline (POSIX ms) past which the supplier can no longer accept and the
@@ -64,9 +83,10 @@ pub type Order {
   buyer: VerificationKeyHash,
   /// The supplier.
   supplier: VerificationKeyHash,
-  /// Arbitration third party. May be a multi-signature key, or the platform
-  /// itself — its power is bounded by `Arbitrate`.
-  arbiter: VerificationKeyHash,
+  /// Arbitration panel. Its power is bounded on both sides by `Arbitrate`:
+  /// it can only pick a figure between what the buyer declared and what the
+  /// supplier sealed.
+  arbitration: Arbitration,
   terms: Terms,
   state: State,
 }
