@@ -4,7 +4,7 @@ use aiken/cbor
 use aiken/collection/list
 use aiken/crypto.{VerificationKeyHash, blake2b_256}
 use aiken/interval.{Finite, Interval}
-use cardano/address.{Address, VerificationKey}
+use cardano/address.{Address, Script, VerificationKey}
 use cardano/assets.{AssetName, PolicyId, quantity_of}
 use cardano/transaction.{Output, OutputReference, Transaction}
 
@@ -21,7 +21,25 @@ pub fn signed_by(self: Transaction, who: VerificationKeyHash) -> Bool {
   list.has(self.extra_signatories, who)
 }
 
+/// Number of inputs in this transaction locked by the given script.
+///
+/// Used to enforce one order per transaction. See `paid_to` for why that
+/// matters.
+pub fn script_input_count(self: Transaction, policy: PolicyId) -> Int {
+  list.count(
+    self.inputs,
+    fn(i) { i.output.address.payment_credential == Script(policy) },
+  )
+}
+
 /// Total lovelace paid to a payment key by this transaction.
+///
+/// CAUTION: this measures a total over the whole transaction, not a flow
+/// attributable to one order. Two orders settled together would each see the
+/// same outputs and could both be satisfied by a single payment — the classic
+/// double-satisfaction bug. Every caller therefore relies on the transaction
+/// carrying exactly one input from this script, enforced once in the spend
+/// handler via `script_input_count`.
 pub fn paid_to(self: Transaction, who: VerificationKeyHash) -> Int {
   list.reduce(
     self.outputs,

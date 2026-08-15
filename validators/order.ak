@@ -9,7 +9,8 @@ use aiken/collection/list
 use aiken/interval
 use bonlivraison/reconciliation.{Contested, admissible, reconcile}
 use bonlivraison/tx.{
-  continuing_output, event_time, paid_to, signed_by, token_burned, token_name,
+  continuing_output, event_time, paid_to, script_input_count, signed_by,
+  token_burned, token_name,
 }
 use bonlivraison/types.{
   Accept, Accepted, Action, Arbitrate, Cancel, ClaimSilence, Close, CloseDispute,
@@ -39,152 +40,175 @@ validator order {
     expect Script(policy) = address.payment_credential
     let escrow = lovelace_of(input.output.value)
 
-    when action is {
-      // --- The supplier commits ----------------------------------------
-      Accept { lines, total } -> {
-        expect Created { .. } = d.state
-        and {
-          signed_by(self, d.supplier)?,
-          interval.is_entirely_before(
-            self.validity_range,
-            d.terms.acceptance_deadline,
-          )?,
-          (total > 0)?,
-          // The escrow must cover the commitment, otherwise the buyer could
-          // promise without provisioning.
-          (escrow >= total)?,
-          continues(self, address, policy, d, Accepted { lines, total }, escrow)?,
-        }
-      }
-
-      // --- The buyer withdraws, or the deadline has passed --------------
-      Cancel -> {
-        expect Created { .. } = d.state
-        and {
-          or {
-            signed_by(self, d.buyer),
-            interval.is_entirely_after(
+    and {
+      // One order per transaction.
+      //
+      // `paid_to` and `token_burned` read the transaction as a whole, so two
+      // orders settled together would each be satisfied by the same outputs:
+      // a single payment to the supplier would discharge both, and the buyer
+      // would take a full delivery for free. Two orders from the same
+      // buyer/supplier pair on the same morning is the normal case in food
+      // service, not an edge case.
+      //
+      // Batching is not a loss here. One order = one UTxO = one state token,
+      // so orders never contend for the same UTxO and there is nothing to
+      // batch for throughput. Wallet inputs funding the fee are unaffected:
+      // only inputs locked by this script are counted.
+      (script_input_count(self, policy) == 1)?,
+      when action is {
+        // --- The supplier commits ----------------------------------------
+        Accept { lines, total } -> {
+          expect Created { .. } = d.state
+          and {
+            signed_by(self, d.supplier)?,
+            interval.is_entirely_before(
               self.validity_range,
               d.terms.acceptance_deadline,
-            ),
-          }?,
-          token_burned(self, policy, d.token)?,
-          (paid_to(self, d.buyer) + self.fee >= escrow)?,
+            )?,
+            (total > 0)?,
+            // The escrow must cover the commitment, otherwise the buyer could
+            // promise without provisioning.
+            (escrow >= total)?,
+            continues(
+              self,
+              address,
+              policy,
+              d,
+              Accepted { lines, total },
+              escrow,
+            )?,
+          }
         }
-      }
 
-      // --- The manifest is sealed as the truck departs -------------------
-      Ship { manifest, manifest_total } -> {
-        expect Accepted { total, .. } = d.state
-        and {
-          signed_by(self, d.supplier)?,
-          (manifest_total > 0)?,
-          // No post-agreement inflation: never invoice beyond what was
-          // accepted.
-          (manifest_total <= total)?,
-          continues(
-            self,
-            address,
-            policy,
-            d,
-            Shipped {
-              manifest,
-              manifest_total,
-              // Upper bound, not lower: see `tx.event_time`. Reading the
-              // lower bound here would let the supplier back-date the
-              // shipment and expire the buyer's reception window before it
-              // ever opened.
-              shipped_at: event_time(self.validity_range),
-            },
-            escrow,
-          )?,
+        // --- The buyer withdraws, or the deadline has passed --------------
+        Cancel -> {
+          expect Created { .. } = d.state
+          and {
+            or {
+              signed_by(self, d.buyer),
+              interval.is_entirely_after(
+                self.validity_range,
+                d.terms.acceptance_deadline,
+              ),
+            }?,
+            token_burned(self, policy, d.token)?,
+            (paid_to(self, d.buyer) + self.fee >= escrow)?,
+          }
         }
-      }
 
-      // --- The buyer declares what was actually received -----------------
-      Declare { receipt, accepted_total } -> {
-        expect Shipped { manifest_total, shipped_at, .. } = d.state
-        let declared_at = event_time(self.validity_range)
-        let preconditions = and {
-            signed_by(self, d.buyer)?,
-            admissible(manifest_total, accepted_total)?,
-            interval.is_entirely_before(
+        // --- The manifest is sealed as the truck departs -------------------
+        Ship { manifest, manifest_total } -> {
+          expect Accepted { total, .. } = d.state
+          and {
+            signed_by(self, d.supplier)?,
+            (manifest_total > 0)?,
+            // No post-agreement inflation: never invoice beyond what was
+            // accepted.
+            (manifest_total <= total)?,
+            continues(
+              self,
+              address,
+              policy,
+              d,
+              Shipped {
+                manifest,
+                manifest_total,
+                // Upper bound, not lower: see `tx.event_time`. Reading the
+                // lower bound here would let the supplier back-date the
+                // shipment and expire the buyer's reception window before it
+                // ever opened.
+                shipped_at: event_time(self.validity_range),
+              },
+              escrow,
+            )?,
+          }
+        }
+
+        // --- The buyer declares what was actually received -----------------
+        Declare { receipt, accepted_total } -> {
+          expect Shipped { manifest_total, shipped_at, .. } = d.state
+          let declared_at = event_time(self.validity_range)
+          let preconditions = and {
+              signed_by(self, d.buyer)?,
+              admissible(manifest_total, accepted_total)?,
+              interval.is_entirely_before(
+                self.validity_range,
+                shipped_at + d.terms.reception_window,
+              )?,
+            }
+
+          when reconcile(manifest_total, accepted_total, d.terms.tolerance) is {
+            // Significant gap: the undisputed part settles at closing, the
+            // delta stays in escrow for the duration of the arbitration.
+            Contested -> and {
+                preconditions,
+                continues(
+                  self,
+                  address,
+                  policy,
+                  d,
+                  Disputed {
+                    manifest_total,
+                    accepted_total,
+                    receipt,
+                    declared_at,
+                  },
+                  escrow,
+                )?,
+              }
+            // Exact or trivial: immediate settlement, no arbitration.
+            _ -> and {
+                preconditions,
+                settle(self, d, policy, accepted_total, escrow)?,
+              }
+          }
+        }
+
+        // --- The buyer's silence counts as acceptance ----------------------
+        ClaimSilence -> {
+          expect Shipped { manifest_total, shipped_at, .. } = d.state
+          and {
+            signed_by(self, d.supplier)?,
+            interval.is_entirely_after(
               self.validity_range,
               shipped_at + d.terms.reception_window,
             )?,
+            settle(self, d, policy, manifest_total, escrow)?,
           }
-
-        when reconcile(manifest_total, accepted_total, d.terms.tolerance) is {
-          // Significant gap: the undisputed part settles at closing, the
-          // delta stays in escrow for the duration of the arbitration.
-          Contested -> and {
-              preconditions,
-              continues(
-                self,
-                address,
-                policy,
-                d,
-                Disputed {
-                  manifest_total,
-                  accepted_total,
-                  receipt,
-                  declared_at,
-                },
-                escrow,
-              )?,
-            }
-          // Exact or trivial: immediate settlement, no arbitration.
-          _ -> and {
-              preconditions,
-              settle(self, d, policy, accepted_total, escrow)?,
-            }
         }
-      }
 
-      // --- The buyer's silence counts as acceptance ----------------------
-      ClaimSilence -> {
-        expect Shipped { manifest_total, shipped_at, .. } = d.state
-        and {
-          signed_by(self, d.supplier)?,
-          interval.is_entirely_after(
-            self.validity_range,
-            shipped_at + d.terms.reception_window,
-          )?,
-          settle(self, d, policy, manifest_total, escrow)?,
+        // --- The arbiter rules, within bounds it does not choose -----------
+        Arbitrate { final_total } -> {
+          expect Disputed { manifest_total, accepted_total, declared_at, .. } =
+            d.state
+          and {
+            signed_by(self, d.arbiter)?,
+            (final_total >= accepted_total)?,
+            (final_total <= manifest_total)?,
+            interval.is_entirely_before(
+              self.validity_range,
+              declared_at + d.terms.dispute_window,
+            )?,
+            settle(self, d, policy, final_total, escrow)?,
+          }
         }
-      }
 
-      // --- The arbiter rules, within bounds it does not choose -----------
-      Arbitrate { final_total } -> {
-        expect Disputed { manifest_total, accepted_total, declared_at, .. } =
-          d.state
-        and {
-          signed_by(self, d.arbiter)?,
-          (final_total >= accepted_total)?,
-          (final_total <= manifest_total)?,
-          interval.is_entirely_before(
-            self.validity_range,
-            declared_at + d.terms.dispute_window,
-          )?,
-          settle(self, d, policy, final_total, escrow)?,
+        // --- The arbiter never ruled: the buyer prevails -------------------
+        CloseDispute -> {
+          expect Disputed { accepted_total, declared_at, .. } = d.state
+          and {
+            interval.is_entirely_after(
+              self.validity_range,
+              declared_at + d.terms.dispute_window,
+            )?,
+            or {
+              signed_by(self, d.buyer),
+              signed_by(self, d.supplier),
+            }?,
+            settle(self, d, policy, accepted_total, escrow)?,
+          }
         }
-      }
-
-      // --- The arbiter never ruled: the buyer prevails -------------------
-      CloseDispute -> {
-        expect Disputed { accepted_total, declared_at, .. } = d.state
-        and {
-          interval.is_entirely_after(
-            self.validity_range,
-            declared_at + d.terms.dispute_window,
-          )?,
-          or {
-            signed_by(self, d.buyer),
-            signed_by(self, d.supplier),
-          }?,
-          settle(self, d, policy, accepted_total, escrow)?,
-        }
-      }
+      },
     }
   }
 
@@ -718,16 +742,36 @@ test reception_window_runs_from_the_sealed_timestamp() fail {
   order.spend(Some(dat(sealed)), ClaimSilence, ref, tx)
 }
 
-// ### Known open finding — Critical 2, not yet fixed
-//
-// This test PASSES, and that is the bug. It is kept as an executable record
-// of the vulnerability until the fix lands.
+// ### Double satisfaction (regression tests for the one-order-per-tx rule)
 
-/// Double satisfaction. Two orders from the same buyer/supplier pair settled
+/// A wallet input funding the fee is not a script input, so ordinary
+/// settlement still works. This is the test that proves the fix is not
+/// over-restrictive.
+test wallet_input_alongside_the_order_is_fine() {
+  let funding =
+    Input { output_reference: ref_b, output: to_key(buyer, 5_000_000) }
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(100_000_000, shipped), funding],
+      outputs: [to_key(supplier, 80_000_000), to_key(buyer, 25_000_000)],
+      mint: from_asset(policy, token, -1),
+      validity_range: interval.between(10_100, 10_200),
+      extra_signatories: [buyer],
+    }
+  order.spend(
+    Some(dat(shipped)),
+    Declare { receipt: #"ff", accepted_total: 80_000_000 },
+    ref,
+    tx,
+  )
+}
+
+/// ATTACK, now blocked: two orders from the same buyer/supplier pair settled
 /// in one transaction. `paid_to` counts OUTPUTS, not per-order flow, so a
-/// single 80 ADA payment satisfies both validator invocations: the supplier
-/// delivers 160 ADA of goods and collects 80.
-test known_issue_double_satisfaction() {
+/// single 80 ADA payment used to satisfy both validator invocations — the
+/// supplier delivered 160 ADA of goods and collected 80.
+test double_satisfaction_refused() fail {
   let tx =
     Transaction {
       ..placeholder,
