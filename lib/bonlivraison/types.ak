@@ -63,6 +63,22 @@ pub type Terms {
   /// Triviality threshold, in euro cents. Below it, the gap is credited to
   /// the buyer automatically: arbitrating would cost more than the gap.
   tolerance: Int,
+  /// Extra delay (ms) after which a stalled order may be closed by anyone.
+  ///
+  /// Two states could otherwise never close: `Accepted` with a supplier that
+  /// never ships (`Ship` carries no deadline of its own), and `Shipped` once
+  /// the buyer's window has run out and the supplier does not claim. Both are
+  /// reachable by one party simply going quiet.
+  ///
+  /// It is deliberately long — a fortnight, not hours. Its job is to bound the
+  /// life of a dead order, never to race a live one: on the `Shipped` path the
+  /// supplier keeps its exclusive claim for the whole of this delay, and it is
+  /// the supplier submitting for itself that makes the fee its own.
+  ///
+  /// Not bounded by the validator. The supplier reads the whole datum before
+  /// signing `Accept`, so an unreasonable value is refused there, off-chain,
+  /// like every other term.
+  abandon_grace: Int,
 }
 
 /// Successive states of an order.
@@ -117,13 +133,31 @@ pub type Action {
   /// Buyer: declares what was received. `accepted_total` is the result of the
   /// min() rule computed off-chain over the lines.
   Declare { receipt: Commitment, accepted_total: Int }
-  /// Supplier: the buyer's silence counts as accepting the manifest.
+  /// Supplier — or anyone, once `abandon_grace` has run on top of the
+  /// reception window: the buyer's silence counts as accepting the manifest.
+  ///
+  /// Opening this to a stranger takes nothing from the supplier. The figure
+  /// this path records is the manifest the supplier sealed itself in `Ship`,
+  /// and the contract already treats it as agreed once the buyer's window
+  /// closes. Submitting is bookkeeping, not a declaration.
   ClaimSilence
   /// Panel: records the arbitrated figure, bounded by
   /// [accepted_total, manifest_total]. Records it; moves nothing.
   Arbitrate { final_total: Int }
   /// The arbiter never ruled: the buyer's figure prevails.
   CloseDispute
+  /// Anyone: the supplier accepted and never shipped. Closes the order and
+  /// returns the deposit.
+  ///
+  /// Only from `Accepted`. Nothing left the warehouse and neither side ever
+  /// declared a figure, so this closes the record without attesting anything
+  /// — the one state where that is the correct reading. `Shipped` is served
+  /// by `ClaimSilence`, which has a figure to record.
+  ///
+  /// Anchored on `acceptance_deadline + abandon_grace`. `Accept` requires the
+  /// transaction to fall entirely before the deadline and this one entirely
+  /// after the grace, so the two can never both be valid.
+  Abandon
 }
 
 /// State-token operations.

@@ -15,9 +15,9 @@ use bonlivraison/tx.{
   signed_by, token_burned, token_name, well_formed_panel,
 }
 use bonlivraison/types.{
-  Accept, Accepted, Action, Arbitrate, Arbitration, Cancel, ClaimSilence, Close,
-  CloseDispute, Created, Declare, Disputed, Open, Order, Ship, Shipped, State,
-  Terms, TokenAction,
+  Abandon, Accept, Accepted, Action, Arbitrate, Arbitration, Cancel,
+  ClaimSilence, Close, CloseDispute, Created, Declare, Disputed, Open, Order,
+  Ship, Shipped, State, Terms, TokenAction,
 }
 use cardano/address.{Address, Script, VerificationKey}
 use cardano/assets.{
@@ -177,13 +177,25 @@ validator order {
         ClaimSilence -> {
           // The attested figure on this path is the sealed manifest itself.
           // It is on the record in the datum; nothing needs to move.
+          //
+          // Which is why a stranger may submit this once the grace has run,
+          // and why doing so takes nothing from the supplier: the figure was
+          // sealed in `Ship`, and the contract already treats it as agreed
+          // past the reception window. A supplier that never submits is not
+          // withdrawing its claim, only declining to pay a fee. The order
+          // would otherwise stay open for good, on the word of a buyer that
+          // said nothing and a supplier that did not follow up.
           expect Shipped { shipped_at, .. } = d.state
+          let window_closed = shipped_at + d.terms.reception_window
           and {
-            signed_by(self, d.supplier)?,
-            interval.is_entirely_after(
-              self.validity_range,
-              shipped_at + d.terms.reception_window,
-            )?,
+            interval.is_entirely_after(self.validity_range, window_closed)?,
+            or {
+              signed_by(self, d.supplier),
+              interval.is_entirely_after(
+                self.validity_range,
+                window_closed + d.terms.abandon_grace,
+              ),
+            }?,
             close_order(self, d, policy, deposit)?,
           }
         }
@@ -218,6 +230,32 @@ validator order {
               signed_by(self, d.buyer),
               signed_by(self, d.supplier),
             }?,
+            close_order(self, d, policy, deposit)?,
+          }
+        }
+
+        // --- Accepted, never shipped: anyone closes the dead order ---------
+        Abandon -> {
+          // `Ship` carries no deadline of its own, so without this branch a
+          // supplier that accepts and goes quiet strands the order for good,
+          // with the buyer's deposit inside it. `Cancel` cannot help: it is
+          // gated on `Created`.
+          //
+          // No signature at all, by design — the same shape as `Cancel` past
+          // the acceptance deadline. Nothing can be stolen: `close_order`
+          // returns the deposit to the buyer whoever submits, so a stranger
+          // pays the fee to produce an outcome it gains nothing from.
+          //
+          // Nothing shipped and no figure was ever declared: this closes the
+          // record without attesting anything, and the off-chain layer must
+          // render it that way rather than fold it into either party's
+          // discrepancy rate.
+          expect Accepted { .. } = d.state
+          and {
+            interval.is_entirely_after(
+              self.validity_range,
+              d.terms.acceptance_deadline + d.terms.abandon_grace,
+            )?,
             close_order(self, d, policy, deposit)?,
           }
         }
@@ -379,6 +417,10 @@ fn panel() -> Arbitration {
   Arbitration { keys: [buyer, supplier, third_party], threshold: 2 }
 }
 
+/// Scaled down to keep the timings readable. In production `abandon_grace` is
+/// a fortnight; here it is ten times the reception window, which preserves the
+/// only property the tests care about — that it opens well after every other
+/// deadline in the order.
 fn terms() -> Terms {
   Terms {
     acceptance_deadline: 20_000,
@@ -386,6 +428,7 @@ fn terms() -> Terms {
     dispute_window: 1_000,
     // 15 EUR
     tolerance: 1_500,
+    abandon_grace: 5_000,
   }
 }
 
@@ -1036,12 +1079,7 @@ fn order_with_tolerance(tolerance: Int, state: State) -> Order {
     buyer,
     supplier,
     arbitration: panel(),
-    terms: Terms {
-      acceptance_deadline: 20_000,
-      reception_window: 500,
-      dispute_window: 1_000,
-      tolerance,
-    },
+    terms: Terms { ..terms(), tolerance: tolerance },
     state,
   }
 }
@@ -1346,6 +1384,110 @@ test anyone_can_cancel_after_the_deadline() {
     ref,
     closing_tx(created, interval.between(20_100, 20_200), [outsider]),
   )
+}
+
+// ### Liveness exits
+//
+// Every state must close without the cooperation of a party that has gone
+// quiet, or the order — and the buyer's deposit — stays open for good.
+// `Created` and `Disputed` were already covered: `Cancel` is permissionless
+// past the acceptance deadline, `CloseDispute` takes either party. These are
+// the two states that were not.
+//
+// Both new paths open at a grace on top of a deadline that already existed,
+// and the tests below are as much about the delay holding as about the exit
+// working: an escape hatch that opens early is not a safety net, it is a way
+// to close an order over a party that was still entitled to act.
+
+/// The buyer said nothing and the supplier never followed up. Past the grace
+/// anyone closes the order, and what goes on the record is the manifest the
+/// supplier sealed itself — the same figure `ClaimSilence` always recorded.
+/// The sweeper produces the outcome the supplier would have obtained.
+test anyone_can_claim_silence_after_the_grace() {
+  order.spend(
+    Some(dat(shipped)),
+    ClaimSilence,
+    ref,
+    closing_tx(shipped, interval.between(15_600, 15_700), [outsider]),
+  )
+}
+
+/// But not one moment early. Between the reception window and the grace the
+/// claim is the supplier's alone: a stranger closing here would take the fee
+/// — and the CIP-0170 attestation that comes with it — off the party whose
+/// figure is being recorded.
+test outsider_cannot_claim_silence_before_the_grace() fail {
+  order.spend(
+    Some(dat(shipped)),
+    ClaimSilence,
+    ref,
+    closing_tx(shipped, interval.between(10_600, 10_700), [outsider]),
+  )
+}
+
+/// The supplier accepted and never shipped. `Ship` carries no deadline, so
+/// before this branch existed the order stranded with the buyer's deposit
+/// inside it and no transition left. No signature: the submitter pays the fee
+/// and the deposit goes to the buyer regardless.
+test anyone_can_abandon_an_order_that_never_shipped() {
+  order.spend(
+    Some(dat(accepted_state)),
+    Abandon,
+    ref,
+    closing_tx(accepted_state, interval.between(25_100, 25_200), [outsider]),
+  )
+}
+
+/// Past the acceptance deadline but inside the grace, the supplier is late,
+/// not gone. It may still ship. Closing here would let a buyer with second
+/// thoughts cancel an order it is no longer entitled to cancel.
+test abandon_before_the_grace_refused() fail {
+  order.spend(
+    Some(dat(accepted_state)),
+    Abandon,
+    ref,
+    closing_tx(accepted_state, interval.between(20_100, 20_200), [outsider]),
+  )
+}
+
+/// `Abandon` cannot touch a shipped order, whatever the date. Goods left the
+/// warehouse and a manifest is sealed: closing without attesting anything
+/// would erase a figure the supplier is entitled to have recorded, which is
+/// exactly what `ClaimSilence` exists to prevent.
+test abandon_cannot_close_a_shipped_order() fail {
+  order.spend(
+    Some(dat(shipped)),
+    Abandon,
+    ref,
+    closing_tx(shipped, interval.between(25_100, 25_200), [outsider]),
+  )
+}
+
+/// Nor a dispute. A supplier facing an unfavourable ruling must not be able
+/// to wait the panel out and close the record with no figure on it at all.
+/// `Disputed` closes through `Arbitrate` or `CloseDispute`, never here.
+test abandon_cannot_escape_a_dispute() fail {
+  order.spend(
+    Some(dat(dispute_case)),
+    Abandon,
+    ref,
+    closing_tx(dispute_case, interval.between(25_100, 25_200), [supplier]),
+  )
+}
+
+/// Permissionless is not unpriced. Whoever sweeps pays the fee and returns
+/// the deposit to the buyer; it cannot sweep the deposit into its own wallet.
+test abandon_cannot_divert_the_deposit() fail {
+  let tx =
+    Transaction {
+      ..placeholder,
+      inputs: [script_input(min_ada, accepted_state)],
+      outputs: [to_key(outsider, min_ada)],
+      mint: from_asset(policy, token, -1),
+      validity_range: interval.between(25_100, 25_200),
+      extra_signatories: [outsider],
+    }
+  order.spend(Some(dat(accepted_state)), Abandon, ref, tx)
 }
 
 // ### Continuation integrity
