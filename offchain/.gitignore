@@ -1,0 +1,9 @@
+node_modules/
+
+# Key material and provider credentials. Testnet only, but never committed:
+# a committed key is a habit, and the habit is what reaches mainnet.
+.env
+keys.json
+
+# Transaction receipts written by the deploy scripts.
+deployment.json
